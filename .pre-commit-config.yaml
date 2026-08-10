@@ -3,7 +3,7 @@ default_language_version:
 
 # Vendored upstream modules stay byte-diffable against their sources; keep
 # formatters and linters away so upstream-tracking diffs remain minimal.
-exclude: '^(miles/utils/chat_template_utils/templates/encoding_dsv32\.py|miles/rollout/session/anthropic/(protocol|serving)\.py)$'
+exclude: '^(miles/utils/chat_template_utils/templates/encoding_dsv32\.py|miles/rollout/session/anthropic/protocol\.py)$'
 
 ci:
   autofix_prs: true
