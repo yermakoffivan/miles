@@ -12,7 +12,6 @@ from fastapi.responses import JSONResponse
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionResponse
 from starlette.responses import Response
 
-from miles.rollout.session.anthropic import codec as anthropic_codec
 from miles.rollout.session.core import JSON_MEDIA_TYPE, SessionCore, _render_json
 from miles.rollout.session.errors import SessionError
 from miles.rollout.session.linear_trajectory import SessionRegistry
@@ -28,6 +27,11 @@ try:
 except ImportError:  # older sglang lineages keep it under managers/
     from sglang.srt.managers.template_detection import detect_inline_system_support
 
+try:
+    from sglang.srt.entrypoints.anthropic import utils as anthropic_utils
+except ImportError:  # sglang lineages predating the anthropic conversion utils
+    anthropic_utils = None
+
 logger = logging.getLogger(__name__)
 
 # End-to-end metadata kept on Anthropic error responses; everything else from
@@ -41,7 +45,7 @@ def _anthropic_wire_json(model) -> bytes:
 
 
 def _anthropic_error_response(status_code: int, body: bytes, headers: dict | None = None) -> Response:
-    envelope = anthropic_codec.to_anthropic_error(status_code, body)
+    envelope = anthropic_utils.to_anthropic_error(status_code, body)
     kept_headers = {
         k: v
         for k, v in (headers or {}).items()
@@ -129,26 +133,44 @@ def setup_session_routes(app, backend, args):
             body=body,
         )
 
-    # Immutable launch-profile policy for the Anthropic codec, fixed at setup
-    # like the frozen SGLang serving layer did in its constructor.
-    anthropic_context = anthropic_codec.AnthropicRequestContext(
-        merge_inline_system=not detect_inline_system_support(getattr(tokenizer, "chat_template", None))
-    )
+    if anthropic_utils is None:
+        anthropic_context = None
+        logger.warning(
+            "[session] sglang runtime lacks sglang.srt.entrypoints.anthropic.utils; /v1/messages will answer 501."
+        )
+    else:
+        # Immutable launch-profile policy for the Anthropic conversion, fixed
+        # at setup like the SGLang serving layer's constructor probe.
+        anthropic_context = anthropic_utils.AnthropicRequestContext(
+            merge_inline_system=not detect_inline_system_support(getattr(tokenizer, "chat_template", None))
+        )
 
     @app.post("/sessions/{session_id}/v1/messages")
     async def anthropic_messages(request: Request, session_id: str):
         """Anthropic Messages wire wrapper over ``core.chat_completions``.
 
-        The codec converts the wire formats; session/TITO/commit semantics,
-        the canonical OpenAI ``SessionRecord``, and the backend path
-        (``/v1/chat/completions``) are exactly the OpenAI route's. Registered
-        before the catch-all ``session_proxy`` (Starlette matches in
-        registration order).
+        The sglang conversion utils translate the wire formats; session/TITO/
+        commit semantics, the canonical OpenAI ``SessionRecord``, and the
+        backend path (``/v1/chat/completions``) are exactly the OpenAI
+        route's. Registered before the catch-all ``session_proxy`` (Starlette
+        matches in registration order) so Anthropic traffic can never be
+        silently proxied to the backend without session semantics.
         """
+        if anthropic_utils is None:
+            envelope = {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "Anthropic messages support requires an sglang runtime "
+                    "with sglang.srt.entrypoints.anthropic.utils",
+                },
+            }
+            return Response(content=_render_json(envelope), status_code=501, media_type=JSON_MEDIA_TYPE)
+
         body = await request.body()
         try:
-            anthropic_request = anthropic_codec.parse_anthropic_request(body)
-            openai_request = anthropic_codec.to_openai_request(anthropic_request, context=anthropic_context)
+            anthropic_request = anthropic_utils.parse_anthropic_request(body)
+            openai_request = anthropic_utils.to_openai_request(anthropic_request, context=anthropic_context)
             # Force the core call non-streaming so it returns one complete
             # OpenAI JSON body; the client's stream intent is honored below
             # as eagerly materialized fake SSE.
@@ -195,20 +217,14 @@ def setup_session_routes(app, backend, args):
         try:
             openai_response = ChatCompletionResponse.model_validate_json(core_response.body)
             if anthropic_stream:
-                events = anthropic_codec.to_anthropic_fake_sse_events(
-                    openai_response,
-                    model=anthropic_request.model,
-                    id_factory=anthropic_codec.anthropic_message_id,
-                )
+                events = anthropic_utils.to_anthropic_fake_sse_events(openai_response, model=anthropic_request.model)
                 return Response(
                     content=_anthropic_sse_body(events),
                     status_code=200,
                     headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
                     media_type="text/event-stream",
                 )
-            envelope = anthropic_codec.to_anthropic_response(
-                openai_response, id_factory=anthropic_codec.anthropic_message_id
-            )
+            envelope = anthropic_utils.to_anthropic_response(openai_response)
             return Response(content=_anthropic_wire_json(envelope), status_code=200, media_type=JSON_MEDIA_TYPE)
         except Exception:
             # Post-commit conversion failure — the accepted first-version

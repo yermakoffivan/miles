@@ -20,9 +20,15 @@ import miles.rollout.session.core as core_module
 import miles.rollout.session.v2.core as v2_core_module
 from miles.rollout.session import sessions as sessions_module
 from miles.rollout.session.server import SessionServer
+from miles.utils.chat_template_utils.message_matcher_hub import resolve_session_message_matcher, strict_message_matches
 from miles.utils.http_utils import find_available_port
 from miles.utils.test_utils.mock_sglang_server import ProcessResult, with_mock_server
 from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
+
+anthropic_utils = pytest.importorskip(
+    "sglang.srt.entrypoints.anthropic.utils",
+    reason="this sglang lineage predates the anthropic conversion utils",
+)
 
 # Two-key arguments: the qwen25 parser re-serializes them in this key order,
 # so a replay whose input object uses the REVERSED key order re-serializes to
@@ -317,7 +323,7 @@ class TestAnthropicRoute:
 
     def test_post_commit_conversion_failure_returns_500_and_keeps_record(self, anthropic_env):
         session_id = _create_session(anthropic_env.url)
-        with patch.object(sessions_module.anthropic_codec, "to_anthropic_response", side_effect=RuntimeError("boom")):
+        with patch.object(sessions_module.anthropic_utils, "to_anthropic_response", side_effect=RuntimeError("boom")):
             resp = _post_messages(anthropic_env.url, session_id, _payload([{"role": "user", "content": "hello"}]))
         assert resp.status_code == 500
         assert resp.json() == {"type": "error", "error": {"type": "api_error", "message": "Internal server error"}}
@@ -327,7 +333,7 @@ class TestAnthropicRoute:
     def test_sse_build_failure_returns_json_500_not_partial_stream(self, anthropic_env):
         session_id = _create_session(anthropic_env.url)
         with patch.object(
-            sessions_module.anthropic_codec, "to_anthropic_fake_sse_events", side_effect=RuntimeError("boom")
+            sessions_module.anthropic_utils, "to_anthropic_fake_sse_events", side_effect=RuntimeError("boom")
         ):
             resp = _post_messages(
                 anthropic_env.url, session_id, _payload([{"role": "user", "content": "hello"}], stream=True)
@@ -446,3 +452,66 @@ class TestAnthropicCloseRace:
             post_delete = _post_messages(env.url, session_id, payload)
             assert post_delete.status_code == 404
             assert post_delete.json()["error"]["type"] == "not_found_error"
+
+
+class TestMatcherGate:
+    """Design matcher gate: object → string re-serialization may change tool
+    argument spelling; ``strict`` must reject it, ``loose_tool_call`` must
+    accept it, so tool launch profiles default to ``loose_tool_call``."""
+
+    def _replayed_assistant(self, arguments_object: dict) -> dict:
+        request = anthropic_utils.parse_anthropic_request(
+            json.dumps(
+                _payload(
+                    [
+                        {"role": "user", "content": "q"},
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "tool_use", "id": "call1", "name": "f", "input": arguments_object}],
+                        },
+                    ]
+                )
+            ).encode()
+        )
+        context = anthropic_utils.AnthropicRequestContext(merge_inline_system=True)
+        openai_request = anthropic_utils.to_openai_request(request, context=context)
+        return openai_request.model_dump(mode="json", exclude_none=True, by_alias=True)["messages"][-1]
+
+    def test_strict_rejects_and_loose_accepts_respelled_arguments(self):
+        stored = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call1", "index": 0, "type": "function", "function": {"name": "f", "arguments": '{"a":1}'}}
+            ],
+        }
+        replayed = self._replayed_assistant({"a": 1})
+        assert replayed["tool_calls"][0]["function"]["arguments"] == '{"a": 1}'  # json.dumps spelling
+        assert strict_message_matches(stored, replayed) is False
+        loose = resolve_session_message_matcher("loose_tool_call")
+        assert loose(stored, replayed) is True
+
+    def test_strict_accepts_identical_spelling(self):
+        stored = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call1", "index": 0, "type": "function", "function": {"name": "f", "arguments": '{"a": 1}'}}
+            ],
+        }
+        replayed = self._replayed_assistant({"a": 1})
+        assert strict_message_matches(stored, replayed) is True
+
+
+class TestUtilsUnavailable:
+    def test_route_answers_501_without_sglang_utils(self):
+        """On an sglang lineage without the conversion utils the route must
+        answer a clear Anthropic-enveloped 501 instead of letting the
+        catch-all proxy forward /v1/messages without session semantics."""
+        with patch.object(sessions_module, "anthropic_utils", None), _anthropic_env() as env:
+            session_id = _create_session(env.url)
+            resp = _post_messages(env.url, session_id, _payload([{"role": "user", "content": "hi"}]))
+        assert resp.status_code == 501
+        body = resp.json()
+        assert body["type"] == "error" and body["error"]["type"] == "api_error"
+        assert "sglang.srt.entrypoints.anthropic.utils" in body["error"]["message"]
