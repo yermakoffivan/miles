@@ -29,7 +29,7 @@ import tests.ci.run_suite as run_suite_module
 from tests.ci.ci_policy import NIGHTLY_CADENCE, REGULAR_CADENCE, SCHEDULE_POLICIES, resolve_policy, strip_run_ci_prefix
 from tests.ci.ci_register import CIRegistry, HWBackend, discover_ci_files, register_cpu_ci
 from tests.ci.labels import KNOWN_LABELS
-from tests.ci.run_suite import CI_SUITES, build_cpu_pytest_cmd, filter_tests
+from tests.ci.run_suite import CI_SUITES, build_cpu_pytest_cmd, filter_tests, select_requested_files
 
 register_cpu_ci(est_time=1, suite="stage-a-cpu", labels=[])
 
@@ -114,6 +114,59 @@ class TestCISuites:
 
 
 # --- `strip_run_ci_prefix` direct tests -------------------------------------
+
+
+class TestSelectRequestedFiles:
+    """`--files` semantics: an explicit request is the selection.
+
+    Labels and the nightly gate do not apply; every requested file must
+    resolve to an enabled registration in the exact hw/suite or the call is a
+    hard error, never a silent no-op.
+    """
+
+    def test_explicit_file_bypasses_label_and_nightly_filters(self):
+        requested = _make("tests/e2e/x/test_a.py", labels=["megatron"], nightly=True)
+        other = _make("tests/e2e/x/test_b.py", labels=["megatron"])
+        selected = select_requested_files(
+            [requested, other],
+            HWBackend.CUDA,
+            "stage-c-8-gpu-h100",
+            ["tests/e2e/x/test_a.py"],
+        )
+        assert selected == [requested]
+
+    def test_unregistered_file_is_a_hard_error(self):
+        with pytest.raises(ValueError, match="has no CI registration"):
+            select_requested_files(
+                [_make("tests/e2e/x/test_a.py")],
+                HWBackend.CUDA,
+                "stage-c-8-gpu-h100",
+                ["tests/e2e/x/test_missing.py"],
+            )
+
+    def test_wrong_suite_error_names_the_actual_registration(self):
+        tests = [_make("tests/e2e/x/test_a.py", suite="stage-c-4-gpu-h200")]
+        with pytest.raises(ValueError, match=r"registered: CUDA:stage-c-4-gpu-h200"):
+            select_requested_files(tests, HWBackend.CUDA, "stage-c-8-gpu-h100", ["tests/e2e/x/test_a.py"])
+
+    def test_disabled_file_is_a_hard_error(self):
+        tests = [_make("tests/e2e/x/test_a.py", disabled="flaky, see #1")]
+        with pytest.raises(ValueError, match="disabled: flaky"):
+            select_requested_files(tests, HWBackend.CUDA, "stage-c-8-gpu-h100", ["tests/e2e/x/test_a.py"])
+
+    def test_duplicate_request_is_a_hard_error(self):
+        tests = [_make("tests/e2e/x/test_a.py")]
+        with pytest.raises(ValueError, match="duplicate"):
+            select_requested_files(
+                tests,
+                HWBackend.CUDA,
+                "stage-c-8-gpu-h100",
+                ["tests/e2e/x/test_a.py", "tests/e2e/x/test_a.py"],
+            )
+
+    def test_unknown_suite_is_a_hard_error(self):
+        with pytest.raises(ValueError, match="Unknown suite"):
+            select_requested_files([], HWBackend.CUDA, "stage-z", ["tests/e2e/x/test_a.py"])
 
 
 class TestStripRunCiPrefix:
@@ -441,12 +494,13 @@ class TestRunSuiteCLI:
 # --- run_a_suite: resolved policy reaches cadence and runner behavior --------
 
 
-def _run_args(*, hw: str, suite: str, cadence: str, labels: list[str] | None = None):
+def _run_args(*, hw: str, suite: str, cadence: str, labels: list[str] | None = None, files: list[str] | None = None):
     return SimpleNamespace(
         hw=hw,
         suite=suite,
         cadence=cadence,
         labels=labels or [],
+        files=files,
         match_all_labels=False,
         continue_on_error=False,
         auto_partition_id=None,
@@ -510,6 +564,30 @@ class TestRunSuitePolicyIntegration:
         )
         assert result == 0
         assert captured["continue_on_error"] is True
+
+    def test_explicit_files_request_reaches_cuda_runner_without_labels(self, monkeypatch):
+        tests = [
+            _make("tests/e2e/test_requested.py", labels=["megatron"], nightly=True),
+            _make("tests/e2e/test_other.py", labels=["megatron"]),
+        ]
+        self._stub_collection(monkeypatch, tests)
+        captured = {}
+
+        def fake_run_unittest_files(ci_tests, **kwargs):
+            captured["files"] = _names(ci_tests)
+            return 0
+
+        monkeypatch.setattr(run_suite_module, "run_unittest_files", fake_run_unittest_files)
+        result = run_suite_module.run_a_suite(
+            _run_args(
+                hw="cuda",
+                suite="stage-c-8-gpu-h100",
+                cadence=REGULAR_CADENCE,
+                files=["tests/e2e/test_requested.py"],
+            )
+        )
+        assert result == 0
+        assert captured["files"] == {"tests/e2e/test_requested.py"}
 
 
 # --- discover_ci_files: location-based discovery across the CI roots --------
