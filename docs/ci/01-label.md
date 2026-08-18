@@ -20,12 +20,14 @@ A test declares its labels: `register_cuda_ci(..., labels=["megatron"])`. The PR
 
 | Test declares | Runs when |
 |---|---|
-| `labels=[]` (or omitted) | every run whose cadence admits the test (always-on within that cadence) |
+| CPU `labels=[]` (or omitted) | every run whose cadence admits the test (always-on within that cadence) |
 | `labels=["megatron"]` | PR has `run-ci-megatron` |
 | `labels=["sglang"]` | PR has `run-ci-sglang` |
 | `labels=["fsdp", "lora"]` | PR has `run-ci-fsdp` or `run-ci-lora` |
 
 PR labels without the `run-ci-` prefix are ignored.
+
+CUDA and ROCm registrations must declare at least one domain label. GPU runners are scarce and expensive, so an always-on GPU test would defeat the purpose of selecting only the GPU coverage a PR requests.
 
 ### The canonical label list
 
