@@ -87,6 +87,14 @@ class InferenceController(NodeProbeMixin):
 
         await self.wait_expected_num_cells()
 
+    # TEMPORARY, to be reverted with the weight-update fault tolerance work: a suspend that lands
+    # while the trainer is broadcasting takes a rank out of a collective already sized for it, and
+    # the broadcast then waits for a rank nobody will start. Taking the lock the update holds makes
+    # the two take turns. Ray only -- a kubernetes pod can also vanish without asking anyone.
+    @with_lock
+    async def stop_cell_between_weight_updates(self, cell_id: str) -> None:
+        await self._engine_provider.stop_cells(cell_ids=[cell_id])
+
     # -------------------------- take over -----------------------------
 
     @lock_exempt

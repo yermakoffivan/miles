@@ -14,6 +14,10 @@ class _CellStatusSource(Protocol):
     async def get_cell_statuses(self) -> dict[str, CellStatus]: ...
 
 
+class _SuspendGate(Protocol):
+    async def stop_cell_between_weight_updates(self, cell_id: str) -> None: ...
+
+
 class _CellHandler:
     def __init__(
         self,
@@ -22,11 +26,13 @@ class _CellHandler:
         operations: BaseCellOperations,
         controllers: list[_CellStatusSource],
         pool_ids: list[str],
+        suspend_gate: _SuspendGate | None = None,
     ) -> None:
         self._cell_type = cell_type
         self._operations = operations
         self._controllers = controllers
         self._pool_ids = pool_ids
+        self._suspend_gate = suspend_gate
 
     @property
     def cell_type(self) -> str:
@@ -81,6 +87,9 @@ class _CellHandler:
         return await self._operations.cell_infos(pool_ids=self._pool_ids)
 
     async def suspend(self, cell_id: str) -> None:
+        if self._suspend_gate is not None:
+            await self._suspend_gate.stop_cell_between_weight_updates(cell_id=cell_id)
+            return
         await self._operations.suspend(cell_id=cell_id)
 
     async def resume(self, cell_id: str) -> None:

@@ -15,6 +15,7 @@ from miles.ray.rollout.server_cell import compute_pending_rollout_cell_status
 from miles.utils.ft_utils.api_server import server
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
+from miles.utils.workers.types import ClusterBackend
 from miles.utils.http_utils import find_available_port
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.cell_operations.ray import RayCellOperations
@@ -665,7 +666,7 @@ class TestOperationsSelection:
         monkeypatch.setattr(server, "_start_api_server_raw", lambda registry, port: registries.append(registry))
 
         server.start_api_server(
-            args=SimpleNamespace(),
+            args=SimpleNamespace(cluster_backend=ClusterBackend.KUBERNETES.value),
             trainer_models={"actor": make_mock_controller([])},
             inference_controller=MockInferenceController(),
             port=1234,
@@ -676,6 +677,31 @@ class TestOperationsSelection:
         handlers = registries[0]._handlers
         assert len(handlers) == 2
         assert [handler._operations for handler in handlers] == [operations, operations]
+
+    def test_only_ray_gates_a_rollout_suspend_on_the_controller(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A kubernetes pod goes away without asking, so gating there would promise what it cannot keep."""
+        registries: list[_CellRegistry] = []
+        monkeypatch.setattr(server, "compute_trainer_pool_id", lambda role: f"trainer-{role}")
+        monkeypatch.setattr(server, "compute_engine_pool_ids", lambda args: ["engine"])
+        monkeypatch.setattr(server, "_start_api_server_raw", lambda registry, port: registries.append(registry))
+
+        gates = {}
+        for backend in (ClusterBackend.RAY, ClusterBackend.KUBERNETES):
+            registries.clear()
+            controller = MockInferenceController()
+            server.start_api_server(
+                args=SimpleNamespace(cluster_backend=backend.value),
+                trainer_models={},
+                inference_controller=controller,
+                port=1234,
+                ft_components=["rollout"],
+                cell_operations=object(),
+            )
+            (handler,) = registries[0]._handlers
+            gates[backend] = handler._suspend_gate
+
+        assert gates[ClusterBackend.RAY] is not None
+        assert gates[ClusterBackend.KUBERNETES] is None
 
     def test_the_api_server_names_no_ray_worker_manager(self) -> None:
         """Naming it would make the Kubernetes assembly pointless for the half that heals cells."""
