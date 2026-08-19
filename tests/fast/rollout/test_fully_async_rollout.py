@@ -918,3 +918,30 @@ class TestRolloutFnContract:
         """load_rollout_fn gates on issubclass(fn, BaseRolloutFn), so a class that forgets the
         base is rejected at startup no matter how complete its behaviour is."""
         assert issubclass(fully_async.FullyAsyncRolloutFn, BaseRolloutFn)
+
+
+async def test_worker_bounds_in_flight_groups(monkeypatch):
+    release = asyncio.Event()
+
+    async def blocking_generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        await release.wait()
+        return group
+
+    data_source = FakeDataSource()
+    fn = make_fn(monkeypatch, make_args(rollout_batch_size=2), data_source, generate=blocking_generate)
+
+    drain = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=0)))
+    await asyncio.sleep(0.05)
+    assert data_source.num_get_calls == 2  # in-flight bound, not more
+
+    release.set()
+    output = await drain
+    assert len(output.samples) == 2
+
+    def test_the_constructor_input_reaches_the_base(self, monkeypatch):
+        """The base stores it as constructor_input; skipping super().__init__ leaves the
+        attribute missing on every path that reads it."""
+        data_source = FakeDataSource()
+        fn = make_fn(monkeypatch, make_args(rollout_batch_size=1), data_source)
+
+        assert fn.constructor_input.data_source is data_source

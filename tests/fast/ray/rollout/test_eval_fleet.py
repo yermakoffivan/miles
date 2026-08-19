@@ -56,7 +56,7 @@ class FakeEvalServer:
 
     @property
     def api_clients(self):
-        assert self.context_lock.held_in_current_context, "api_clients is read under the server's lock"
+        assert self.context_lock.held_in_current_context(), "api_clients is read under the server's lock"
         return list(self._engines)
 
 
@@ -125,18 +125,24 @@ class TestEvalFleetPinning:
         assert pin.skip_reason == "pin_violation"
         assert len([e for e in log if e[0] == "update_weights_from_disk"]) == 4  # 2 engines x 2 attempts
 
-    async def test_a_router_that_never_becomes_ready_skips_the_eval(self, monkeypatch):
-        """Every other case here neutralises the router wait, so this branch is the only thing that reads it."""
+    async def test_a_cell_that_joined_between_attempts_is_pinned_too(self, router_always_ready):
+        """Membership is read again per attempt, or a cell that joined mid-pin would serve the old weights."""
+        log = []
+        joined, stale = FakeEngine(log), FakeEngine(log)
+        stale.get_weight_version = _answers_version("999")
+        server = FakeEvalServer([stale])
+        fleet = InferenceControllerEvalFleet(make_args(), srv=server)
 
-        async def never_ready(self, timeout=180.0):
-            raise TimeoutError("router never came up")
+        async def join_after_the_first_attempt(*_args, **_kwargs):
+            server._engines = [joined]
+            stale.get_weight_version = _answers_version("5")
 
-        monkeypatch.setattr(eval_fleet_mod.InferenceControllerEvalFleet, "_wait_router_ready", never_ready)
-        fleet = make_fleet(make_args(), [FakeEngine([])])
+        stale.update_weights_from_disk = join_after_the_first_attempt
 
         pin = await fleet.pin("/snap/step_5", "5")
 
-        assert pin.skip_reason == "unhealthy"
+        assert pin == EvalFleetPin(skip_reason=None)
+        assert joined.weight_version == "5"
 
     async def test_does_not_health_probe_the_server(self, router_always_ready):
         """The eval fleet has no fault tolerance: pin goes straight to the weight load."""

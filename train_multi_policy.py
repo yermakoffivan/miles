@@ -109,10 +109,13 @@ async def _run_policy(
     num_rollout_per_epoch: int | None,
 ) -> None:
     model_id = trainer.model_id
-    rounds_of_this_policy = contextlib.nullcontext() if is_leader else parker.running_follower()
 
+    rollout_ids_iter = (
+        range(trainer.start_rollout_id, args.num_rollout) if is_leader else itertools.count(trainer.start_rollout_id)
+    )
+    rounds_of_this_policy = contextlib.nullcontext() if is_leader else parker.running_follower()
     with rounds_of_this_policy:
-        for rollout_id in range(trainer.start_rollout_id, args.num_rollout):
+        for rollout_id in rollout_ids_iter:
             rollout_ids[model_id] = rollout_id
             await inference_controller.prepare_rollout(rollout_id, model_id=model_id)
             rollout_data_pack = await rollout_executor.get(rollout_id, trainer_model_id=model_id)
@@ -133,49 +136,21 @@ async def _run_policy(
             else:
                 await parker.maybe_park_follower()
 
-    rollout_ids_iter = (
-        range(trainer.start_rollout_id, args.num_rollout) if is_leader else itertools.count(trainer.start_rollout_id)
-    )
-    for rollout_id in rollout_ids_iter:
-        rollout_ids[model_id] = rollout_id
-        await inference_controller.prepare_rollout(rollout_id, model_id=model_id)
-        rollout_data_pack = await rollout_executor.get(rollout_id, trainer_model_id=model_id)
-        await trainer.handle.train(rollout_id, rollout_data_pack)
-        remove_rollout_data_refs(args, rollout_data_pack)
-
-        if is_leader:
-            await _maybe_save_globally(
-                args,
-                model_id=model_id,
-                trainers=trainers,
-                rollout_executor=rollout_executor,
-                parker=parker,
-                rollout_ids=rollout_ids,
-                rollout_id=rollout_id,
-                num_rollout_per_epoch=num_rollout_per_epoch,
-            )
-        else:
-            await parker.maybe_park_follower()
-
-        if (rollout_id + 1) % args.update_weights_interval == 0:
-            await update_weights(
-                args,
-                trainer.handle,
-                rollout_executor,
-                inference_controller,
-                rollout_id=rollout_id,
-                trainer_model_id=model_id,
-            )
             if (rollout_id + 1) % args.update_weights_interval == 0:
                 await update_weights(
-                    trainer.handle, rollout_executor, rollout_id=rollout_id, trainer_model_id=model_id
+                    args,
+                    trainer.handle,
+                    rollout_executor,
+                    inference_controller,
+                    rollout_id=rollout_id,
+                    trainer_model_id=model_id,
                 )
 
             if (x := args.debug_exit_after_rollout) is not None and (rollout_id - trainer.start_rollout_id + 1) >= x:
                 logger.info(f"debug_exit_after_rollout={x} reached at rollout_id={rollout_id}, exiting")
                 break
 
-    # TODO: no eval follows; this only resumes health monitoring, and deserves a name of its own
+        # TODO: no eval follows; this only resumes health monitoring, and deserves a name of its own
     await inference_controller.prepare_eval(model_id=model_id)
 
 

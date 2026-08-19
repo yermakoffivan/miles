@@ -97,6 +97,10 @@ def _stub_update_weights(monkeypatch):
     monkeypatch.setattr(multi_policy_driver, "update_weights", AsyncMock())
 
 
+async def _slow_train(rollout_id: int, rollout_data_ref, **kwargs) -> None:
+    await asyncio.sleep(0.05)
+
+
 class TestInitialWeightPublication:
     async def test_every_policy_compares_its_engines_against_its_own_trainer(self):
         """--ci-test asks for this comparison, and running it for one policy would leave the others unchecked."""
@@ -119,10 +123,6 @@ class TestPolicyCompletion:
 
         finished = [call.kwargs["model_id"] for call in context["inference_controller"].prepare_eval.await_args_list]
         assert sorted(finished) == ["a", "b"]
-
-
-async def _slow_train(rollout_id: int, rollout_data_ref, **kwargs) -> None:
-    await asyncio.sleep(0.05)
 
 
 class TestRunPolicies:
