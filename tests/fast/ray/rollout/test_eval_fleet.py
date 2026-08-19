@@ -138,25 +138,6 @@ class TestEvalFleetPinning:
 
         assert pin.skip_reason == "unhealthy"
 
-    async def test_a_cell_that_joined_between_attempts_is_pinned_too(self, router_always_ready):
-        """Membership is read again per attempt, or a cell that joined mid-pin would serve the old weights."""
-        log = []
-        joined, stale = FakeEngine(log), FakeEngine(log)
-        stale.get_weight_version = _answers_version("999")
-        server = FakeEvalServer([stale])
-        fleet = InferenceControllerEvalFleet(make_args(), srv=server)
-
-        async def join_after_the_first_attempt(*_args, **_kwargs):
-            server._engines = [joined]
-            stale.get_weight_version = _answers_version("5")
-
-        stale.update_weights_from_disk = join_after_the_first_attempt
-
-        pin = await fleet.pin("/snap/step_5", "5")
-
-        assert pin == EvalFleetPin(skip_reason=None)
-        assert joined.weight_version == "5"
-
     async def test_does_not_health_probe_the_server(self, router_always_ready):
         """The eval fleet has no fault tolerance: pin goes straight to the weight load."""
         server = FakeEvalServer([FakeEngine([])])

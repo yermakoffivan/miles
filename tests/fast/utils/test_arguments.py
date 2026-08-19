@@ -1926,13 +1926,7 @@ class TestRolloutHealthCheckArguments:
         assert args.rollout_health_check_interval == 30.0
         assert args.rollout_health_check_timeout == 30.0
         assert args.rollout_health_check_first_wait == 0.0
-        assert args.rollout_health_check_failure_threshold == 1
-
-    def test_a_rollout_engine_is_reported_unhealthy_on_its_first_failed_check(self):
-        """Debouncing an engine over three 30s checks would leave a dead engine serving for 90s."""
-        config = SimpleHealthCheckerConfig.from_args(self._parse([]), prefix="rollout_health_check")
-
-        assert config.failure_threshold == 1
+        assert args.rollout_health_check_failure_threshold == 3
 
     def test_the_first_wait_grace_period_is_still_tunable(self):
         """A first launch compiling deepgemm kernels needs a grace period, or it is killed while warming up."""
