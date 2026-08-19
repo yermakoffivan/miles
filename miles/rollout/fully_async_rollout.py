@@ -18,7 +18,6 @@ rollout engines, pausing producer submissions for the duration of the
 
 import asyncio
 import logging
-import time
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout.base_types import (
@@ -50,13 +49,6 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 NO_PROGRESS_WARN_SECS = 30.0
-# a generate request the engines accepted but never answer leaves the producer waiting on a task that
-# never completes, which the sglang /health check cannot see and fault tolerance reads as healthy, so
-# without a bound of its own a lost request stalls the run until whatever runs it gives up on the clock.
-# the floor is above every wait this repository already sanctions -- a cell has 1800s to initialize, a
-# fleet 3600s to become ready, a park 3600s -- because a heal finishes no group while it runs, and a
-# deadline inside that window would kill the runs fault tolerance exists to save
-NO_PROGRESS_DEADLINE_FLOOR_SECS = 7200.0
 
 
 class FullyAsyncRolloutFn(BaseRolloutFn):
@@ -154,16 +146,10 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
     # -------------------------- consumer --------------------------
 
-    def _no_progress_deadline_secs(self) -> float:
-        # a run told its requests may take four hours must not be failed two hours into the first of them
-        return max(NO_PROGRESS_DEADLINE_FLOOR_SECS, float(self.args.sglang_router_request_timeout_secs))
-
     async def _next_group(self, *, current_version: int | None, trainer_model_id: str | None) -> DataBufferInput:
         queue_get = asyncio.create_task(
             self._output.get(current_version=current_version, trainer_model_id=trainer_model_id)
         )
-        deadline_secs = self._no_progress_deadline_secs()
-        started = time.monotonic()
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -178,14 +164,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                     raise RuntimeError("fully-async rollout worker exited without an exception")
                 if queue_get in done:
                     return queue_get.result()
-                waited = time.monotonic() - started
-                if waited >= deadline_secs:
-                    raise RuntimeError(
-                        f"No rollout group finished for {waited:.0f}s while asking for "
-                        f"{trainer_model_id=} {current_version=}; the producer is waiting on generation that the "
-                        f"engines are not answering, and neither their health check nor fault tolerance sees it"
-                    )
-                logger.warning(f"No completed rollout groups for {waited:.0f}s")
+                logger.warning(f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s")
         finally:
             if not queue_get.done():
                 queue_get.cancel()

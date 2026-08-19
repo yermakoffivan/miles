@@ -274,8 +274,6 @@ def _parse_data_buffer_paths(values: Iterable[str] | None) -> dict[str, str]:
             raise ValueError(f"Duplicate model id {model_id!r} in {DATA_BUFFER_PATH_PER_MODEL_FLAG}.")
         ans[model_id] = path
     return ans
-
-
 def _split_by_trainer_model_id(input: DataBufferInput) -> dict[str, DataBufferInput]:
     trainer_model_ids = list(dict.fromkeys(sample.trainer_model_id for sample in iter_samples(input.group)))
     assert None not in trainer_model_ids, (

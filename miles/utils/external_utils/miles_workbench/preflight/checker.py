@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
-from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrapper import Kubectl
@@ -28,7 +26,6 @@ from miles.utils.external_utils.miles_workbench.render import RbacPlan, rbac_pla
 logger = logging.getLogger(__name__)
 
 _ROLES_RESOURCE = "roles.rbac.authorization.k8s.io"
-_MAX_CONCURRENT_QUERIES = 32
 
 
 class _Answer(NamedTuple):
@@ -86,12 +83,10 @@ class Checker:
             f"app.kubernetes.io/managed-by={MANAGED_BY},app.kubernetes.io/name notin ({family})",
         ]
 
-        listings = self._list_in_parallel([(kind, selector) for kind in NAMESPACE_KINDS for selector in selectors])
-
         foreign: list[str] = []
         for kind in NAMESPACE_KINDS:
             for selector in selectors:
-                answer = listings[(kind, selector)]
+                answer = self._query("get", kind, "-n", self.namespace, "-l", selector, "-o", "name")
                 if not answer.ok:
                     if any(marker in answer.output for marker in UNSERVED_RESOURCE_MARKERS):
                         break
@@ -165,10 +160,6 @@ class Checker:
         self.report(True, message)
 
     def denied_rules(self, *rule_sets: dict[str, tuple[str, ...]]) -> list[str]:
-        self._answer_ahead(
-            (verb, resource) for rules in rule_sets for resource, verbs in rules.items() for verb in verbs
-        )
-
         denied = []
         for rules in rule_sets:
             for resource, verbs in rules.items():
@@ -183,37 +174,13 @@ class Checker:
         if (answered := self._answered.get((verb, resource))) is not None:
             return answered
 
-        self._answered[(verb, resource)] = self._ask_can_i(verb, resource)
-        return self._answered[(verb, resource)]
-
-    def _list_in_parallel(self, targets: list[tuple[str, str]]) -> dict[tuple[str, str], _Answer]:
-        with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_QUERIES) as pool:
-            answers = list(
-                pool.map(
-                    lambda target: self._query("get", target[0], "-n", self.namespace, "-l", target[1], "-o", "name"),
-                    targets,
-                )
-            )
-        return dict(zip(targets, answers, strict=True))
-
-    def _answer_ahead(self, wanted: Iterable[tuple[str, str]]) -> None:
-        # one kubectl per rule asked in turn is a round trip per rule, and a plan runs to several
-        # hundred of them, so the wait is the network rather than the cluster's answer
-        pending = sorted({pair for pair in wanted if pair not in self._answered})
-        if not pending:
-            return
-
-        with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_QUERIES) as pool:
-            answers = list(pool.map(lambda pair: self._ask_can_i(*pair), pending))
-        self._answered.update(zip(pending, answers, strict=True))
-
-    def _ask_can_i(self, verb: str, resource: str) -> bool:
         target, _, subresource = resource.partition("/")
         args = ["auth", "can-i", verb, target]
         if subresource:
             args.append(f"--subresource={subresource}")
         args += ["-n", self.namespace]
-        return self._query(*args).ok
+        self._answered[(verb, resource)] = self._query(*args).ok
+        return self._answered[(verb, resource)]
 
     def kubectl(self, *args: str) -> subprocess.CompletedProcess[str]:
         return Kubectl.run_raw(*args)
