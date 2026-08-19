@@ -8,17 +8,16 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi import FastAPI
-
 from tests.fast.ray.rollout.conftest import make_args as make_rollout_args
 
 from miles.ray.rollout.server_cell import compute_pending_rollout_cell_status
 from miles.utils.ft_utils.api_server import server
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
-from miles.utils.workers.types import ClusterBackend
 from miles.utils.http_utils import find_available_port
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.cell_operations.ray import RayCellOperations
+from miles.utils.workers.types import ClusterBackend
 
 from .conftest import (
     MockHandler,

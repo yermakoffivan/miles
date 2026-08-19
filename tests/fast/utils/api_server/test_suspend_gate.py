@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
 
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 

@@ -243,18 +243,6 @@ class TestHealthCheckerActiveness:
         assert not srv.health_checker_activeness.get().active
 
     @pytest.mark.asyncio
-    async def test_aborting_a_weight_update_resumes_probing(self):
-        """end_update_weights resumes nothing, so a failed update used to leave its engines unprobed until a
-        prepare_rollout that a dying run never reaches."""
-        srv = _RecordingServer()
-        controller = _make_controller({"default": srv})
-
-        await controller.start_update_weights()
-        await controller.abort_update_weights()
-
-        assert srv.health_checker_activeness.get().active
-
-    @pytest.mark.asyncio
     async def test_preparing_a_rollout_resumes_probing(self):
         """Probing comes back exactly when the engines start serving traffic again."""
         srv = _RecordingServer()

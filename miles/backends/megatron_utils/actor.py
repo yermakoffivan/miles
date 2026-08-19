@@ -241,7 +241,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        if self.args.update_weights_over_cuda_ipc:
+        if self.args.colocate:
             update_weight_cls = UpdateWeightFromTensor
         else:
             if self.args.update_weight_transfer_mode == "broadcast":

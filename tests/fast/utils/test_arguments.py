@@ -501,30 +501,6 @@ class TestClusterBackend:
 
         assert args.object_store_backend == "mooncake"
 
-    def test_a_colocated_kubernetes_run_does_not_hand_its_engine_a_cuda_ipc_handle(self):
-        """This backend colocates two pods, and neither can open the pids the other's handles name."""
-        args = self._parse(["--cluster-backend", "kubernetes", "--colocate", "--num-rollout", "1"])
-
-        miles_validate_args(args)
-
-        assert not args.update_weights_over_cuda_ipc
-
-    def test_a_colocated_ray_run_still_updates_weights_over_cuda_ipc(self):
-        """Ray colocates inside one process space, where the handle is the cheapest transfer there is."""
-        args = self._parse(["--colocate", "--num-rollout", "1"])
-
-        miles_validate_args(args)
-
-        assert args.update_weights_over_cuda_ipc
-
-    def test_a_disaggregated_run_never_updates_weights_over_cuda_ipc(self):
-        """Separate hosts share no process space, so this must not turn on merely because ray is in use."""
-        args = self._parse(["--num-rollout", "1"])
-
-        miles_validate_args(args)
-
-        assert not args.update_weights_over_cuda_ipc
-
     def test_the_override_outlives_the_custom_config_file(self, tmp_path):
         """That file is applied late, so a ray store named there would otherwise survive the override."""
         config = tmp_path / "override.yaml"

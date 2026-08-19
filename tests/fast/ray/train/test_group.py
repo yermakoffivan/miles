@@ -1,4 +1,3 @@
-import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +10,7 @@ from tests.fast.ray.train.conftest import get_raw_actor_handles, make_deployment
 
 import miles.ray.train.group as group_module
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
-from miles.ray.train.group import TrainerController, UnreachableSnapshotError, compute_trainer_health_checker_config
+from miles.ray.train.group import TrainerController, compute_trainer_health_checker_config
 from miles.utils import object_store
 from miles.utils.audit_utils.event_logger.logger import EventLogger, read_events, set_event_logger
 from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent
@@ -1162,61 +1161,6 @@ class TestUpdateWeightsReturnsTheVersion:
         await group.update_weights(info=info)
 
         group._execute_first_alive.assert_awaited_once_with("update_weights", info=info)
-
-
-class TestUpdateWeightsIsBoundedPerSnapshot:
-    def _make_group(self, *, broadcast: AsyncMock) -> TrainerController:
-        group = TrainerController.__new__(TrainerController)
-        group.args = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, trainer_model_id=None)
-        group._execute_first_alive = broadcast
-        return group
-
-    async def test_a_broadcast_that_never_answers_is_given_up_on_rather_than_waited_out(self):
-        """An engine healed mid-broadcast leaves the collective a member short, and a collective waiting on a
-        rank nobody will start waits forever, so without a bound the run stops with every cell reporting healthy."""
-        never_answers = asyncio.Event()
-
-        async def _hang(*_args, **_kwargs):
-            await never_answers.wait()
-
-        group = self._make_group(broadcast=AsyncMock(side_effect=_hang))
-
-        with patch.object(group_module, "_UPDATE_WEIGHTS_TIMEOUT_SECONDS", 0.05):
-            with pytest.raises(UnreachableSnapshotError):
-                await asyncio.wait_for(group.update_weights(info=MagicMock()), timeout=5.0)
-
-    async def test_a_timed_out_broadcast_is_not_waited_on_again_under_the_same_snapshot(self):
-        """Deliberately without patching _RETRY_MAX_ATTEMPTS: at the production 30 the resnapshot loop starved."""
-        never_answers = asyncio.Event()
-
-        async def _hang(*_args, **_kwargs):
-            await never_answers.wait()
-
-        broadcast = AsyncMock(side_effect=_hang)
-        group = self._make_group(broadcast=broadcast)
-
-        with patch.object(group_module, "_UPDATE_WEIGHTS_TIMEOUT_SECONDS", 0.01):
-            with pytest.raises(UnreachableSnapshotError):
-                await group.update_weights(info=MagicMock())
-
-        assert broadcast.await_count == 1, (
-            f"the broadcast ran {broadcast.await_count} times under one snapshot, so a snapshot that can never "
-            f"be reached again was waited on more than once"
-        )
-
-    @pytest.mark.parametrize(
-        "first_failure",
-        [RuntimeError("cell 0 is gone"), TimeoutError("the worker rpc call gave up")],
-        ids=["a cell that raised", "a worker reporting its own timeout"],
-    )
-    async def test_a_failure_that_is_not_our_own_deadline_is_retried_under_the_same_snapshot(self, first_failure):
-        """Only our own deadline means the snapshot is unreachable; a worker's own timeout is retryable here, so
-        both must find the next cell rather than ask for a new snapshot."""
-        broadcast = AsyncMock(side_effect=[first_failure, [7]])
-        group = self._make_group(broadcast=broadcast)
-
-        assert await group.update_weights(info=MagicMock()) == 7
-        assert broadcast.await_count == 2
 
 
 class TestInitForwardsModelFlags:
