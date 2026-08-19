@@ -3,7 +3,6 @@
 
 import contextlib
 import dataclasses
-import math
 import threading
 import time
 from collections.abc import Iterator
