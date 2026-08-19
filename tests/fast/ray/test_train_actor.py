@@ -3,10 +3,11 @@ import socket
 from types import SimpleNamespace
 
 import pytest
+
 from miles.ray import train_actor
 from miles.ray.train_actor import TrainRayActor
-from miles.utils.workers.env_vars import SUBPROCESS_INDEX_ENV_VAR
 from miles.utils.init_once import InitOnce
+from miles.utils.workers.env_vars import SUBPROCESS_INDEX_ENV_VAR
 
 
 def _inited_guard() -> InitOnce:

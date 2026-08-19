@@ -909,9 +909,10 @@ class TestInitLifecycle:
         monkeypatch.setattr(
             dashboard_hooks, "register_router", lambda args: pytest.fail("debug_train_only has no router")
         )
+        provider = _RefusingWorkerProvider()
         controller = InferenceController(
             make_args(debug_train_only=True),
-            engine_provider=_RefusingWorkerProvider(),
+            engine_provider=provider,
             router_providers=[_RefusingWorkerProvider()],
         )
 
