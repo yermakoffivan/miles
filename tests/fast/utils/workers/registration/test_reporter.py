@@ -92,7 +92,10 @@ class _FakeTrigger:
         self.notified += 1
 
     async def wait(self) -> None:
-        return None
+        # answering without ever suspending starves the loop this runs in: the reporter sends in a
+        # tight cycle and nothing else gets a turn, the cancellation that ends the test included.
+        # python 3.12 stopped wrapping wait_for's awaitable in a task, so nothing else yields either
+        await asyncio.sleep(0)
 
 
 def _reporter(*, provider: _FakeEngineProvider, hub_endpoint: _FakeHub):
