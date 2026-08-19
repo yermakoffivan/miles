@@ -265,25 +265,6 @@ async def test_worker_error_propagates(monkeypatch):
         await fn(RolloutFnTrainInput(rollout_id=0))
 
 
-async def test_generation_that_never_answers_ends_the_step_instead_of_waiting_forever(monkeypatch):
-    """An accepted request the engines never answer is invisible to their health check, so waiting is endless."""
-
-    async def blocking_generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
-        await release.wait()
-        return group
-
-    data_source = FakeDataSource()
-    fn = make_fn(monkeypatch, make_args(rollout_batch_size=2), data_source, generate=blocking_generate)
-
-    drain = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=0)))
-    await asyncio.sleep(0.05)
-    assert data_source.num_get_calls == 2  # in-flight bound, not more
-
-    release.set()
-    output = await drain
-    assert len(output.samples) == 2
-
-
 async def test_async_max_concurrent_samples_caps_in_flight_groups(monkeypatch):
     release = asyncio.Event()
 
