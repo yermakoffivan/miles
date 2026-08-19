@@ -36,9 +36,7 @@ def run_analysis(event_dir: Path) -> list[Any]:
     if not events:
         return []
 
-    return [
-        issue for model_events in _partition_by_model_id(events) for issue in _check_one_model_id(model_events)
-    ]
+    return [issue for model_events in _partition_by_model_id(events) for issue in _check_one_model_id(model_events)]
 
 
 def _check_one_model_id(events: list[Any]) -> list[Any]:
