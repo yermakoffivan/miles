@@ -14,8 +14,11 @@ from miles.ray.placement_group import (
     create_training_model,
     create_training_models,
     take_over_trainers,
+    update_weights,
 )
 from miles.ray.rollout.eval_fleet import EvalFleetInfo
+from miles.ray.train.group import UnreachableSnapshotError
+from miles.utils.retry_utils import NonRetryableError
 from miles.utils.workers.types import DeployComponent, DeploymentIdentity
 from miles.utils.workers.worker_spec import HostAndPort
 
@@ -31,8 +34,19 @@ def _make_args(**overrides) -> Namespace:
         sglang_router_port=None,
         cluster_backend="ray",
         eval_num_gpus=0,
+        eval_num_gpus_per_engine=1,
         debug_train_only=False,
+        debug_rollout_only=False,
         use_session_server=False,
+        sglang_config=None,
+        prefill_num_servers=None,
+        rollout_num_gpus=2,
+        rollout_num_gpus_per_engine=1,
+        offload_rollout=False,
+        colocate=False,
+        hf_checkpoint="/models/fake",
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=8,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -360,6 +374,117 @@ class TestUpdateWeights:
         await update_weights(self._args(), actor_model, rollout_executor, inference_controller)
 
         rollout_executor.set_weight_version.assert_not_awaited()
+
+
+class TestAnUpdateAlwaysGivesTheControllerLockBack:
+    def _fakes(self, *, broadcast: AsyncMock):
+        actor_model = MagicMock()
+        actor_model.update_weights = broadcast
+        rollout_executor = MagicMock()
+        rollout_executor.set_weight_version = AsyncMock()
+        inference_controller = MagicMock(
+            start_update_weights=AsyncMock(),
+            end_update_weights=AsyncMock(),
+            abort_update_weights=AsyncMock(),
+        )
+        return actor_model, rollout_executor, inference_controller
+
+    @staticmethod
+    def _args():
+        return Namespace(debug_train_only=True, debug_rollout_only=False)
+
+    async def test_a_broadcast_that_fails_hands_the_lock_back_without_claiming_the_weights_arrived(self):
+        """The controller holds its lock from the start of an update until the end of it, and every path it
+        owns waits behind that lock, including the reconcile that replaces the engine whose loss ended the
+        broadcast; a lock kept here is a fleet that can never heal."""
+        actor_model, rollout_executor, controller = self._fakes(
+            broadcast=AsyncMock(side_effect=NonRetryableError("engine went away"))
+        )
+
+        with pytest.raises(NonRetryableError):
+            await update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        assert controller.abort_update_weights.await_count == (placement_group_module._UPDATE_WEIGHTS_MAX_SNAPSHOTS)
+        controller.end_update_weights.assert_not_awaited()
+
+    async def test_the_lock_comes_back_after_every_snapshot_that_could_not_be_reached(self):
+        """A lock held across broadcasts that can never finish is a fleet the heal cannot reach."""
+        broadcast = AsyncMock(
+            side_effect=UnreachableSnapshotError("the collective is sized for an engine that is gone")
+        )
+        actor_model, rollout_executor, controller = self._fakes(broadcast=broadcast)
+
+        with pytest.raises(UnreachableSnapshotError):
+            await update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        assert controller.abort_update_weights.await_count == broadcast.await_count
+        controller.end_update_weights.assert_not_awaited()
+
+    async def test_a_broadcast_that_succeeds_still_ends_the_update_normally(self):
+        """The failure path must not become the only path: a good update still marks its engines ready."""
+        actor_model, rollout_executor, controller = self._fakes(broadcast=AsyncMock(return_value=11))
+
+        await update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        controller.end_update_weights.assert_awaited_once()
+        controller.abort_update_weights.assert_not_awaited()
+
+
+class TestAnUpdateOutlivesTheFleetItStartedOn(TestAnUpdateAlwaysGivesTheControllerLockBack):
+    async def test_a_snapshot_the_fleet_outgrew_is_replaced_rather_than_retried(self):
+        """A snapshot names the engines the collective is sized for, so one taken before a cell was replaced
+        can never be reached again however often it is retried; only a new snapshot can."""
+        actor_model, rollout_executor, controller = self._fakes(
+            broadcast=AsyncMock(side_effect=[NonRetryableError("engine went away"), 7])
+        )
+
+        await update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        assert controller.start_update_weights.await_count == 2
+        controller.end_update_weights.assert_awaited_once()
+
+    async def test_the_engines_of_a_snapshot_that_failed_are_never_told_their_weights_arrived(self):
+        """Marking them ready would serve the old weights as though the broadcast had finished."""
+        actor_model, rollout_executor, controller = self._fakes(
+            broadcast=AsyncMock(side_effect=[NonRetryableError("engine went away"), 7])
+        )
+
+        await update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        controller.abort_update_weights.assert_awaited_once()
+
+    async def test_a_fleet_that_never_comes_back_still_fails(self):
+        """Asking for a fresh snapshot forever would hide a fleet that is gone for good behind a healthy run."""
+        actor_model, rollout_executor, controller = self._fakes(
+            broadcast=AsyncMock(side_effect=NonRetryableError("engine went away"))
+        )
+
+        with pytest.raises(NonRetryableError):
+            await update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        assert controller.start_update_weights.await_count == (placement_group_module._UPDATE_WEIGHTS_MAX_SNAPSHOTS)
+
+    async def test_a_fleet_that_hangs_on_every_snapshot_is_still_given_up_on(self):
+        """Asking for a fresh snapshot is what recovers a healed fleet, so a fleet that never answers turns a
+        single bounded wait into a sequence of them; the sequence has to end too."""
+        actor_model, rollout_executor, controller = self._fakes(
+            broadcast=AsyncMock(side_effect=UnreachableSnapshotError("the broadcast ran out of time"))
+        )
+
+        with pytest.raises(UnreachableSnapshotError):
+            await update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        requested = controller.start_update_weights.await_count
+        assert requested > 1, "a hang has to be answered by a fresh snapshot, not by giving up on the first"
+        assert requested == placement_group_module._UPDATE_WEIGHTS_MAX_SNAPSHOTS
+
+    async def test_an_update_that_works_asks_for_one_snapshot(self):
+        """The recovery path must not cost the ordinary path a second pass over the fleet."""
+        actor_model, rollout_executor, controller = self._fakes(broadcast=AsyncMock(return_value=11))
+
+        await update_weights(self._args(), actor_model, rollout_executor, controller)
+
+        controller.start_update_weights.assert_awaited_once()
 
 
 def _make_trainer_handle(*, initialized: bool = False) -> MagicMock:

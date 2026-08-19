@@ -125,14 +125,13 @@ jobs:
           driver-opts: |
             image=moby/buildkit:latest
             network=host
-      - name: Install Python + dependencies
+      - name: Install the build script's interpreter
         if: env.BUILD == 'true'
         run: |
-          if ! command -v python3 >/dev/null || ! command -v pip3 >/dev/null; then
-            apt-get -o DPkg::Lock::Timeout=600 update
-            apt-get -o DPkg::Lock::Timeout=600 install -y python3 python3-pip
-          fi
-          pip3 install --break-system-packages --ignore-installed typer
+          # a runner shares its dpkg lock with everything else installing on the same host, so
+          # reaching for apt here makes the build wait on a stranger and then fail outright
+          command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Login to Docker Hub
         if: env.BUILD == 'true'
         uses: docker/login-action@v3
@@ -143,7 +142,7 @@ jobs:
         id: build
         if: env.BUILD == 'true'
         run: |
-          python3 docker/build.py --variant cu13 --image-tag custom \
+          uv run --no-project --with typer python docker/build.py --variant cu13 --image-tag custom \
             --custom-tag pr-${{ github.event.pull_request.number }} --push
           echo "built=true" >> "$GITHUB_OUTPUT"
       - name: Nothing to build

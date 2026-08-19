@@ -1,12 +1,14 @@
 import asyncio
 import threading
 from argparse import Namespace
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+import miles.backends.megatron_utils.update_weight.update_weight_from_distributed.broadcast as broadcast_module
 from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.broadcast import (
     UpdateWeightFromDistributed,
     connect_rollout_engines_from_distributed,
@@ -115,6 +117,7 @@ class TestConnectRolloutEnginesFromDistributed:
             "world_size": 8,
             "rank": 0,
             "group_name": "miles-pp_0",
+            "timeout": timedelta(seconds=broadcast_module._RENDEZVOUS_TIMEOUT_SECONDS),
         }
 
     def test_an_engine_that_refuses_the_group_fails_the_connect(self) -> None:
@@ -129,6 +132,42 @@ class TestConnectRolloutEnginesFromDistributed:
                     Namespace(rollout_num_gpus_per_engine=2),
                     "miles-pp_0",
                     [_AcceptingEngine(), _AcceptingEngine(), _RefusingEngine()],
+                )
+
+
+class TestAnEngineLostMidRendezvousDoesNotWedgeTheRun:
+    def test_the_join_is_bounded_rather_than_left_to_the_transfer_budget(self) -> None:
+        """A rendezvous is a handshake; torch's half hour is a weight-transfer budget, and waiting
+        it out is indistinguishable from a slow broadcast to everything watching the run."""
+        assert broadcast_module._RENDEZVOUS_TIMEOUT_SECONDS < 30 * 60
+
+    def test_the_engine_that_never_answered_is_named_when_the_join_gives_up(self) -> None:
+        """An engine healed mid-rendezvous leaves the group a rank short forever, so the join has to
+        end; it must then report the invitation that failed rather than its own timeout."""
+        with (
+            patch(f"{_BROADCAST_MODULE}.ray") as ray_mock,
+            patch(f"{_BROADCAST_MODULE}.init_process_group", side_effect=TimeoutError("rendezvous timed out")),
+        ):
+            ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
+            with pytest.raises(RuntimeError, match="engine refused the group"):
+                connect_rollout_engines_from_distributed(
+                    Namespace(rollout_num_gpus_per_engine=2),
+                    "miles-pp_0",
+                    [_AcceptingEngine(), _RefusingEngine()],
+                )
+
+    def test_a_join_that_fails_with_every_engine_willing_still_surfaces(self) -> None:
+        """Nothing may swallow the join's own failure when the engines have no complaint of their own."""
+        with (
+            patch(f"{_BROADCAST_MODULE}.ray") as ray_mock,
+            patch(f"{_BROADCAST_MODULE}.init_process_group", side_effect=TimeoutError("rendezvous timed out")),
+        ):
+            ray_mock._private.services.get_node_ip_address.return_value = "10.0.0.1"
+            with pytest.raises(TimeoutError, match="rendezvous timed out"):
+                connect_rollout_engines_from_distributed(
+                    Namespace(rollout_num_gpus_per_engine=2),
+                    "miles-pp_0",
+                    [_AcceptingEngine(), _AcceptingEngine()],
                 )
 
 

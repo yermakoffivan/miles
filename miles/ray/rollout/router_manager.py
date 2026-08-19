@@ -14,6 +14,12 @@ from miles.utils.workers.worker_spec import HostAndPort
 
 logger = logging.getLogger(__name__)
 
+_ROUTER_READY_TIMEOUT_SECONDS = 30.0
+# a router binds its port as its first act, but a session server imports transformers and loads the
+# tokenizer and chat template before it binds, and it is launched through the platform now, so the
+# same wait also covers being scheduled; the router's budget left neither of those any room
+_SESSION_SERVER_READY_TIMEOUT_SECONDS = 300.0
+
 
 async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerProvider]) -> dict[str, HostAndPort]:
     """Wait for every model's router and record its address on ``args``, keyed by model name.
@@ -50,7 +56,7 @@ async def wait_router_ready(*, model_idx: int, provider: BaseWorkerProvider) -> 
     """Wait until the model's router, launched by the platform, is reachable and return its address."""
     worker_name = compute_router_worker_name(model_idx)
     router_addr = (await provider.get_addrs(worker_name=worker_name))["primary"]
-    await wait_tcp_ready(router_addr.host, router_addr.port, timeout=30)
+    await wait_tcp_ready(router_addr.host, router_addr.port, timeout=_ROUTER_READY_TIMEOUT_SECONDS)
     logger.info(f"Router ready at {router_addr}")
     return router_addr
 
@@ -72,8 +78,13 @@ async def wait_session_server_ready(args, *, provider: BaseWorkerProvider | None
 
     assert provider is not None
     addrs = [
-        (await provider.get_addrs(worker_name=session_server_worker_name(index)))["primary"]
-        for index in range(args.num_session_servers)
+        named["primary"]
+        for named in await asyncio.gather(
+            *[
+                provider.get_addrs(worker_name=session_server_worker_name(index))
+                for index in range(args.num_session_servers)
+            ]
+        )
     ]
     # The canonical driver-side value; rollout code picks from this list. Instances may sit on
     # different hosts, so each one is addressed in full rather than by a port under a shared ip.
@@ -87,5 +98,7 @@ async def wait_session_server_ready(args, *, provider: BaseWorkerProvider | None
     # The per-address map OpenAIEndpointTracer.create reads instance ids from,
     # replacing the per-session /health probe.
     args.session_server_instance_ids = instance_ids
-    await asyncio.gather(*[wait_tcp_ready(addr.host, addr.port, timeout=30) for addr in addrs])
+    await asyncio.gather(
+        *[wait_tcp_ready(addr.host, addr.port, timeout=_SESSION_SERVER_READY_TIMEOUT_SECONDS) for addr in addrs]
+    )
     logger.info(f"Session servers ready at {args.session_server_addrs} ({len(addrs)} instances)")

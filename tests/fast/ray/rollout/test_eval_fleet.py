@@ -56,7 +56,7 @@ class FakeEvalServer:
 
     @property
     def api_clients(self):
-        assert self.context_lock.held_in_current_context(), "api_clients is read under the server's lock"
+        assert self.context_lock.held_in_current_context, "api_clients is read under the server's lock"
         return list(self._engines)
 
 
@@ -124,6 +124,19 @@ class TestEvalFleetPinning:
 
         assert pin.skip_reason == "pin_violation"
         assert len([e for e in log if e[0] == "update_weights_from_disk"]) == 4  # 2 engines x 2 attempts
+
+    async def test_a_router_that_never_becomes_ready_skips_the_eval(self, monkeypatch):
+        """Every other case here neutralises the router wait, so this branch is the only thing that reads it."""
+
+        async def never_ready(self, timeout=180.0):
+            raise TimeoutError("router never came up")
+
+        monkeypatch.setattr(eval_fleet_mod.InferenceControllerEvalFleet, "_wait_router_ready", never_ready)
+        fleet = make_fleet(make_args(), [FakeEngine([])])
+
+        pin = await fleet.pin("/snap/step_5", "5")
+
+        assert pin.skip_reason == "unhealthy"
 
     async def test_a_cell_that_joined_between_attempts_is_pinned_too(self, router_always_ready):
         """Membership is read again per attempt, or a cell that joined mid-pin would serve the old weights."""

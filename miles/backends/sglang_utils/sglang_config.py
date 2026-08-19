@@ -281,6 +281,11 @@ def resolve_sglang_config(args) -> SglangConfig:
 
 
 def _compute_raw_sglang_config(args) -> _RawSglangConfig:
+    # A train-only debug run never sizes a rollout fleet, so there is nothing here to describe
+    # and every caller that reads this config has to come away with no inference components.
+    if args.debug_train_only:
+        return _RawSglangConfig(models=[])
+
     eval_num_gpus = args.eval_num_gpus
 
     if getattr(args, "sglang_config", None) is not None:

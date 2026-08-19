@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
+import time
 
 import pytest
 
@@ -586,3 +587,32 @@ class TestGatherAndRaiseFirst:
                 await async_utils.gather_and_raise_first([_failing("quiet")])
 
         assert caplog.text == ""
+
+
+class TestGetAsyncLoop:
+    def test_threads_arriving_together_share_one_loop(self, monkeypatch):
+        """A second loop would strand whatever already awaits on the first, which no caller can recover from."""
+        monkeypatch.setattr(async_utils, "async_loop", None)
+        built: list[object] = []
+
+        class SlowToBuild:
+            def __init__(self):
+                time.sleep(0.05)
+                built.append(self)
+
+        monkeypatch.setattr(async_utils, "AsyncLoopThread", SlowToBuild)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            loops = [future.result() for future in [pool.submit(async_utils.get_async_loop) for _ in range(8)]]
+
+        assert len(built) == 1
+        assert all(loop is built[0] for loop in loops)
+
+    def test_a_later_caller_is_answered_from_the_loop_already_built(self, monkeypatch):
+        """The guard must not rebuild the loop once one exists, nor pay a lock on every rollout call."""
+        monkeypatch.setattr(async_utils, "async_loop", None)
+        monkeypatch.setattr(async_utils, "AsyncLoopThread", lambda: object())
+
+        first = async_utils.get_async_loop()
+
+        assert async_utils.get_async_loop() is first

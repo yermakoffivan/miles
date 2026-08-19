@@ -10,6 +10,7 @@ register_cuda_ci(
     est_time=2900,
     suite="stage-c-8-gpu-h200",
     labels=["ft-short"],
+    disabled="killing one of four cells leaves three replicas, which the batch cannot be split across",
 )
 
 _MODE: str = "kill_train__dp4_cp2__fake_rollout__moe_5layer"

@@ -11,7 +11,7 @@ from miles.ray.rollout.cell_state import CellAddrInfo, StateDisposed, StateServi
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
 
 
-def _make_meta() -> ServerCellMetadata:
+def _make_meta(*, needs_offload: bool = False) -> ServerCellMetadata:
     return ServerCellMetadata(
         model_id="default",
         worker_type="regular",
@@ -20,7 +20,7 @@ def _make_meta() -> ServerCellMetadata:
         gpu_offset=0,
         sglang_api_key=None,
         worker_name="inference-engine-0-0-0-0",
-        needs_offload=False,
+        needs_offload=needs_offload,
         update_weights=True,
         workers_hash="pseudo-hash-0",
     )
@@ -31,10 +31,10 @@ class _StubProvider:
         raise AssertionError(f"disposing a cell must not address it ({worker_name=})")
 
 
-def _make_cell(*, router_api_client: MagicMock, **args_overrides: object) -> ServerCell:
+def _make_cell(*, router_api_client: MagicMock, needs_offload: bool = False, **args_overrides: object) -> ServerCell:
     return ServerCell(
         args=make_args(num_gpus_per_node=8, **args_overrides),
-        meta=_make_meta(),
+        meta=_make_meta(needs_offload=needs_offload),
         router_api_client=router_api_client,
         provider=_StubProvider(),
     )
@@ -112,6 +112,48 @@ class TestServerCellDispose:
         await cell.dispose()
 
         client.remove_worker.assert_awaited_once()
+
+
+class TestDisposeGivesBackGpuMemory:
+    @pytest.mark.asyncio
+    async def test_a_colocated_cell_gives_its_gpu_memory_back_before_it_leaves(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Leaving is what takes the cell out of the fleet the offload pass walks, so memory it is
+        still holding is memory nobody comes back for, and the trainer sharing the gpu wakes into it."""
+        released = AsyncMock()
+        monkeypatch.setattr(ServerCell, "offload", released)
+        cell = _make_cell(router_api_client=_make_router_api_client(), needs_offload=True)
+        await _register(cell, state=StateServing, server_url="http://10.0.0.7:30000", bootstrap_port=None)
+
+        await cell.dispose()
+
+        released.assert_awaited_once()
+        assert isinstance(cell._state, StateDisposed)
+
+    @pytest.mark.asyncio
+    async def test_a_cell_that_shares_no_gpu_is_not_asked_to(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An engine holding a gpu of its own has nobody waiting for that memory."""
+        released = AsyncMock()
+        monkeypatch.setattr(ServerCell, "offload", released)
+        cell = _make_cell(router_api_client=_make_router_api_client(), needs_offload=False)
+        await _register(cell, state=StateServing, server_url="http://10.0.0.8:30000", bootstrap_port=None)
+
+        await cell.dispose()
+
+        released.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_engine_already_gone_does_not_block_the_teardown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The usual reason a cell is disposed is that it died, and a dead engine has already
+        given its memory back; failing here would leave the cell in the fleet forever."""
+        monkeypatch.setattr(ServerCell, "offload", AsyncMock(side_effect=RuntimeError("connection refused")))
+        cell = _make_cell(router_api_client=_make_router_api_client(), needs_offload=True)
+        await _register(cell, state=StateServing, server_url="http://10.0.0.9:30000", bootstrap_port=None)
+
+        await cell.dispose()
+
+        assert isinstance(cell._state, StateDisposed)
 
 
 class TestServerCellRegisterRobustness:

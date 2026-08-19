@@ -33,6 +33,7 @@ from miles.utils.external_utils.command_utils.helm_backend.launcher.values.helm_
 )
 from miles.utils.ft_utils.health_checker import SimpleHealthCheckerConfig
 from miles.utils.function_registry import function_registry
+from miles.utils.object_store_config import compute_mooncake_init_kwargs
 from miles.utils.run_uuid import RUN_UUID_LENGTH, validate_run_uuid
 
 PATH_ARGS = ["--rollout-function-path", "--custom-generate-function-path", "--custom-inference-engine-provider-path"]
@@ -500,6 +501,30 @@ class TestClusterBackend:
 
         assert args.object_store_backend == "mooncake"
 
+    def test_a_colocated_kubernetes_run_does_not_hand_its_engine_a_cuda_ipc_handle(self):
+        """This backend colocates two pods, and neither can open the pids the other's handles name."""
+        args = self._parse(["--cluster-backend", "kubernetes", "--colocate", "--num-rollout", "1"])
+
+        miles_validate_args(args)
+
+        assert not args.update_weights_over_cuda_ipc
+
+    def test_a_colocated_ray_run_still_updates_weights_over_cuda_ipc(self):
+        """Ray colocates inside one process space, where the handle is the cheapest transfer there is."""
+        args = self._parse(["--colocate", "--num-rollout", "1"])
+
+        miles_validate_args(args)
+
+        assert args.update_weights_over_cuda_ipc
+
+    def test_a_disaggregated_run_never_updates_weights_over_cuda_ipc(self):
+        """Separate hosts share no process space, so this must not turn on merely because ray is in use."""
+        args = self._parse(["--num-rollout", "1"])
+
+        miles_validate_args(args)
+
+        assert not args.update_weights_over_cuda_ipc
+
     def test_the_override_outlives_the_custom_config_file(self, tmp_path):
         """That file is applied late, so a ray store named there would otherwise survive the override."""
         config = tmp_path / "override.yaml"
@@ -509,6 +534,36 @@ class TestClusterBackend:
         miles_validate_args(args)
 
         assert args.object_store_backend == "mooncake"
+
+    def test_the_store_this_backend_chose_is_also_configured_by_it(self):
+        """The launcher asserts these kwargs exist and rewrites their host to the master it starts, so
+        a run that never asked for mooncake in the first place must not have to name them itself: with
+        them unset, every kubernetes run using the defaults died before a single pod did any work."""
+        args = self._parse(["--cluster-backend", "kubernetes", "--num-rollout", "1"])
+
+        miles_validate_args(args)
+
+        assert ":" in args.mooncake_store_init_kwargs["master_server_address"]
+        assert set(args.mooncake_store_init_kwargs) == set(compute_mooncake_init_kwargs())
+
+    def test_a_named_store_configuration_is_left_alone(self):
+        """A run that configured the store itself knows something the default cannot."""
+        named = '{"master_server_address": "10.0.0.2:60000", "protocol": "rdma"}'
+        args = self._parse(
+            ["--cluster-backend", "kubernetes", "--mooncake-store-init-kwargs", named, "--num-rollout", "1"]
+        )
+
+        miles_validate_args(args)
+
+        assert args.mooncake_store_init_kwargs == {"master_server_address": "10.0.0.2:60000", "protocol": "rdma"}
+
+    def test_a_ray_run_is_not_given_a_store_it_does_not_use(self):
+        """The ray store needs none of this, and inventing kwargs would misreport what the run uses."""
+        args = self._parse(["--cluster-backend", "ray", "--num-rollout", "1"])
+
+        miles_validate_args(args)
+
+        assert args.mooncake_store_init_kwargs is None
 
     def test_a_ray_run_may_keep_the_ray_object_store(self):
         """Every existing run takes this path, and nothing about it changed."""
@@ -1895,6 +1950,13 @@ class TestRolloutHealthCheckArguments:
         assert args.rollout_health_check_interval == 30.0
         assert args.rollout_health_check_timeout == 30.0
         assert args.rollout_health_check_first_wait == 0.0
+        assert args.rollout_health_check_failure_threshold == 1
+
+    def test_a_rollout_engine_is_reported_unhealthy_on_its_first_failed_check(self):
+        """Debouncing an engine over three 30s checks would leave a dead engine serving for 90s."""
+        config = SimpleHealthCheckerConfig.from_args(self._parse([]), prefix="rollout_health_check")
+
+        assert config.failure_threshold == 1
 
     def test_the_first_wait_grace_period_is_still_tunable(self):
         """A first launch compiling deepgemm kernels needs a grace period, or it is killed while warming up."""
@@ -2027,6 +2089,9 @@ class TestMilesValidateArgsCheckpointResolution:
     def _parse(extra, tmp_path):
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
+        # megatron owns --finetune and the fallback only ever turns it on, so the run that
+        # leaves it alone has to start from the default megatron would have given it
+        parser.set_defaults(finetune=False)
         return parser.parse_args(
             ["--hf-checkpoint", str(tmp_path), "--ref-load", str(tmp_path), "--num-rollout", "1"]
             + extra

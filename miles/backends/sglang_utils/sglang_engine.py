@@ -6,6 +6,7 @@ import shlex
 import sys
 
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import LORA_TARGET_ALL_MODULES, SUPPORTED_LORA_TARGET_MODULES
 
 from miles.backends.megatron_utils.lora_utils import (
     convert_target_modules_to_hf,
@@ -17,6 +18,10 @@ from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.multi_lora import is_multi_lora_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def sglang_supports_gated_launch() -> bool:
+    return any(field.name == "gated_launch_port" for field in dataclasses.fields(ServerArgs))
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
@@ -66,7 +71,7 @@ def compute_engine_launch_cmd(
     port: int,
     disaggregation_bootstrap_port: int | None,
     engine_info_bootstrap_port: int,
-    gated_launch_port: int,
+    gated_launch_port: int | None,
 ) -> str:
     server_args_dict = _compute_server_args(
         args,
@@ -102,7 +107,7 @@ def _compute_server_args(
     engine_info_bootstrap_port: int | None,
     sglang_overrides: dict | None,
     num_gpus_per_engine: int | None,
-    gated_launch_port: int,
+    gated_launch_port: int | None,
 ):
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
@@ -123,7 +128,6 @@ def _compute_server_args(
         "dist_init_addr": dist_init_addr,
         "gpu_id_step": 1,
         "base_gpu_id": base,
-        "gated_launch_port": gated_launch_port,
         # parallel
         "tp_size": _gpus_per_engine,
         "dp_size": args.sglang_dp_size,
@@ -159,20 +163,22 @@ def _compute_server_args(
         kwargs["dtype"] = "float16"
     if engine_info_bootstrap_port is not None:
         kwargs["engine_info_bootstrap_port"] = engine_info_bootstrap_port
+    if gated_launch_port is not None:
+        kwargs["gated_launch_port"] = gated_launch_port
 
     if is_multi_lora_enabled(args):
         kwargs["enable_lora"] = True
         kwargs["max_loras_per_batch"] = args.multi_lora_n_adapters
         kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
-        kwargs["lora_target_modules"] = convert_target_modules_to_hf(args.target_modules)
+        kwargs["lora_target_modules"] = _lora_target_modules_for_cli(args)
     elif lora_rollout_enabled(args):
         kwargs["enable_lora"] = True
         kwargs["max_loras_per_batch"] = 1
         kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
         if sglang_lora_target_all_sentinel(args):
-            kwargs["lora_target_modules"] = ["all"]
+            kwargs["lora_target_modules"] = [LORA_TARGET_ALL_MODULES]
         else:
-            kwargs["lora_target_modules"] = convert_target_modules_to_hf(args.target_modules)
+            kwargs["lora_target_modules"] = _lora_target_modules_for_cli(args)
 
         if args.lora_adapter_path is not None and kwargs.get("load_format") != "dummy":
             kwargs["lora_paths"] = [f"{LORA_ADAPTER_NAME}={args.lora_adapter_path}"]
@@ -212,3 +218,14 @@ def _compute_server_args(
             kwargs.pop(key)
 
     return kwargs
+
+
+def _lora_target_modules_for_cli(args) -> list[str]:
+    targets = convert_target_modules_to_hf(args.target_modules)
+    # sglang's lora runtime serves names its own --lora-target-modules choices do not list, and an
+    # engine is launched through that cli, so naming one of them is an engine that never starts;
+    # the shorthand covers them because it resolves against what the runtime knows
+    if unlisted := sorted(set(targets) - set(SUPPORTED_LORA_TARGET_MODULES)):
+        logger.info(f"Letting sglang discover its lora targets: it does not accept {unlisted} on the command line")
+        return [LORA_TARGET_ALL_MODULES]
+    return targets

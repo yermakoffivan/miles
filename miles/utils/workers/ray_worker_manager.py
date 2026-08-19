@@ -15,6 +15,7 @@ from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import wrap_ipv6
 from miles.utils.logging_utils import configure_logger
+from miles.utils.misc import NodeProbeMixin
 from miles.utils.ray_utils import compute_ray_pin_head_options
 from miles.utils.workers.addr_allocator import PortAllocator
 from miles.utils.workers.backend_capability.base import BackendCapability, DeferredBackendCapability
@@ -109,10 +110,17 @@ class RayWorkerManager:
         cell.actors[worker_in_cell_index].actor_handle.inject_fault.remote(mode)
 
     def get_worker_addrs(self, worker_name: str) -> NamedHostAndPorts:
-        return self._find_actor(worker_name).self_addrs
+        addrs = self._find_actor(worker_name).self_addrs
+        assert addrs is not None, (
+            f"{worker_name} has not been given its ports yet; a caller reading them now would take the "
+            f"endpoints it cannot find for endpoints the worker does not have"
+        )
+        return addrs
 
     def get_addrs(self) -> dict[str, list[NamedHostAndPorts]]:
-        return {name: [a.self_addrs for c in g.cells if c.alive for a in c.actors] for name, g in self._pools.items()}
+        return {
+            name: [a.described_addrs for c in g.cells if c.alive for a in c.actors] for name, g in self._pools.items()
+        }
 
     def get_worker_infos(self, cell_id: str) -> list[WorkerInfo]:
         cell = self._find_cell(cell_id)
@@ -138,7 +146,7 @@ class RayWorkerManager:
         return WorkerInfo(
             name=actor.name,
             generation=actor.generation,
-            self_addrs=actor.self_addrs,
+            self_addrs=actor.described_addrs,
             gpu_ids=actor.gpu_ids,
             worker_class=actor.spec.worker_class if served_over_rpc else None,
         )
@@ -274,7 +282,7 @@ class _CellManager(Generic[SpecT]):
         return CellInfo(
             cell_id=self.cell_id,
             pool_id=self.spec.name,
-            alive=self.alive,
+            alive=self.alive and self._all_workers_addressed,
             worker_names=[a.name for a in self.actors] if self.actors is not None else [],
             workers_hash=f"pseudo-hash-{self.generation}",
             meta=f(WorkerMetaContext(cell_index=self.cell_index)) if (f := self.spec.meta) is not None else {},
@@ -287,6 +295,14 @@ class _CellManager(Generic[SpecT]):
     @property
     def alive(self) -> bool:
         return self.actors is not None
+
+    @property
+    def _all_workers_addressed(self) -> bool:
+        # an observer builds a cell out of what this reports, reading its workers' endpoints as it
+        # goes, and a worker still being given its ports describes itself as holding none of them;
+        # reporting such a cell hands the observer a worker it cannot address, which fails the whole
+        # reconcile sweep and leaves even the healthy cells of that round unreconciled
+        return all(a.self_addrs is not None for a in self.actors or [])
 
 
 _SHUTDOWN_TIMEOUT = 30
@@ -309,20 +325,34 @@ class _BaseActorManager(Generic[SpecT]):
         raise NotImplementedError
 
     async def alloc_ports(self) -> None:
-        self.self_addrs = {}
+        # every port here is allocated across an await, and the manager answers address reads in
+        # between, so a map published as it fills lets a reader see a worker with only some of its
+        # endpoints and read the absence of the rest as the worker not having them at all
+        allocated: NamedHostAndPorts = {}
 
         node_ip = await self.actor_handle._get_node_ip.remote()
         for port_info in self.spec.port_infos:
             if self.worker_in_cell_index != 0 and port_info.mode == "master":
                 continue
-            port = (
-                self.manager.port_allocator.alloc(
+            if port_info.allow_dynamic:
+                port = self.manager.port_allocator.alloc(
                     self.actor_handle, node_ip=node_ip, consecutive=port_info.num_consecutive
                 )
-                if port_info.allow_dynamic
-                else port_info.static_port + (self.parent.cell_index if port_info.offset_by_cell else 0)
-            )
-            self.self_addrs[port_info.name] = HostAndPort(host=wrap_ipv6(node_ip), port=port)
+            else:
+                port = port_info.static_port + (self.parent.cell_index if port_info.offset_by_cell else 0)
+                await self._assert_static_port_is_free(port, port_name=port_info.name, node_ip=node_ip)
+            allocated[port_info.name] = HostAndPort(host=wrap_ipv6(node_ip), port=port)
+
+        self.self_addrs = allocated
+
+    async def _assert_static_port_is_free(self, port: int, *, port_name: str, node_ip: str) -> None:
+        # A readiness probe cannot tell a stale listener from our own, so a run that skipped this
+        # would wire itself to whatever the previous run left behind on this port.
+        free = await self.actor_handle._is_port_available.remote(port=port)
+        assert free, (
+            f"Port {port} on {node_ip} is already in use, so {self.name} cannot serve its {port_name!r} "
+            f"endpoint there; a stale process from an earlier run is the usual cause"
+        )
 
     @property
     def launch_context(self) -> WorkerLaunchContext:
@@ -395,6 +425,12 @@ class _BaseActorManager(Generic[SpecT]):
         pg = self.manager.pgs[pg_name]
         base_gpu_id = int(pg.pg_reordered_gpu_ids[self.gpu_slot_index])
         return list(range(base_gpu_id, base_gpu_id + self.spec.scheduling.num_gpu_slots_per_worker))
+
+    @property
+    def described_addrs(self) -> NamedHostAndPorts:
+        # a description is taken of whatever exists at the time, so it has to render a worker whose
+        # ports are still being allocated as holding none rather than as holding some of them
+        return self.self_addrs if self.self_addrs is not None else {}
 
     @property
     def master_mode_addrs(self) -> NamedHostAndPorts:
@@ -475,7 +511,9 @@ def _build_serve_worker(
 def bootstrapped_worker_class(worker_class_path: str) -> type:
     worker_class = load_function(worker_class_path)
 
-    class BootstrappedWorker(worker_class):
+    # the manager probes every actor it launches for its node and its free ports, so a worker
+    # class that never asked to be reachable that way still has to answer
+    class BootstrappedWorker(worker_class, NodeProbeMixin):
         def __init__(
             self, *, ctor_kwargs: Callable[[WorkerCtorContext], dict[str, Any]], context: WorkerLaunchContext
         ) -> None:

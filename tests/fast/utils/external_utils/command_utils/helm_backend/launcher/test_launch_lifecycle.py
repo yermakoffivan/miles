@@ -361,7 +361,7 @@ class TestAnOrdinaryRelaunchOfAHotRestartedRun:
 class TestTheRelaunchKeepsThePodsItAttachesTo:
     def test_the_pods_keep_the_record_of_the_launch_that_installed_them(self, monkeypatch, tmp_path):
         """A new record in the pod template is a new pod template, so a resize would restart every worker."""
-        recorded = _Recorded()
+        recorded = _Recorded(kubectl=[], upgraded=[])
 
         _launch(monkeypatch, tmp_path, recorded, installed=True, rendered=_RENDERED_WITH_RECORD)
 
@@ -383,7 +383,7 @@ class TestTheRelaunchKeepsThePodsItAttachesTo:
         assert _written_values(tmp_path)["run"]["launchRecord"] == _INSTALLED_RECORD
 
     def test_a_first_install_points_the_pods_at_the_record_of_this_launch(self, monkeypatch, tmp_path):
-        recorded = _Recorded()
+        recorded = _Recorded(kubectl=[], upgraded=[])
 
         _launch(monkeypatch, tmp_path, recorded, installed=False)
 
@@ -392,7 +392,7 @@ class TestTheRelaunchKeepsThePodsItAttachesTo:
 
     def test_this_launch_is_still_recorded_on_disk_when_the_pods_keep_an_older_one(self, monkeypatch, tmp_path):
         """The pods keeping their own record must not cost the run the record of this invocation."""
-        recorded = _Recorded()
+        recorded = _Recorded(kubectl=[], upgraded=[])
 
         _launch(monkeypatch, tmp_path, recorded, installed=True, rendered=_RENDERED_WITH_RECORD)
 

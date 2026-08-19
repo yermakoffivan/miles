@@ -90,6 +90,7 @@ def make_args(**overrides) -> Namespace:
         rollout_sample_filter_path=None,
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
+        sglang_router_request_timeout_secs=14400,
         eval_num_gpus=0,
     )
     defaults.update(overrides)
@@ -262,6 +263,43 @@ async def test_worker_error_propagates(monkeypatch):
 
     with pytest.raises(RuntimeError, match="generation exploded"):
         await fn(RolloutFnTrainInput(rollout_id=0))
+
+
+async def test_generation_that_never_answers_ends_the_step_instead_of_waiting_forever(monkeypatch):
+    """An accepted request the engines never answer is invisible to their health check, so waiting is endless."""
+
+    async def never_answers(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(fully_async, "NO_PROGRESS_WARN_SECS", 0.01)
+    monkeypatch.setattr(fully_async, "NO_PROGRESS_DEADLINE_FLOOR_SECS", 0.05)
+    fn = make_fn(
+        monkeypatch, make_args(sglang_router_request_timeout_secs=0), FakeDataSource(), generate=never_answers
+    )
+
+    with pytest.raises(RuntimeError, match="No rollout group finished"):
+        await fn(RolloutFnTrainInput(rollout_id=0))
+
+
+async def test_a_slow_but_moving_producer_is_not_cut_off(monkeypatch):
+    """The deadline must measure a total absence of progress, not how long one group took."""
+
+    async def slow_generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        await asyncio.sleep(0.03)
+        return group
+
+    monkeypatch.setattr(fully_async, "NO_PROGRESS_WARN_SECS", 0.01)
+    monkeypatch.setattr(fully_async, "NO_PROGRESS_DEADLINE_FLOOR_SECS", 0.05)
+    fn = make_fn(
+        monkeypatch,
+        make_args(rollout_batch_size=2, sglang_router_request_timeout_secs=0),
+        FakeDataSource(),
+        generate=slow_generate,
+    )
+
+    output = await fn(RolloutFnTrainInput(rollout_id=0))
+
+    assert len(output.samples) == 2
 
 
 async def test_worker_bounds_in_flight_groups(monkeypatch):
@@ -741,7 +779,7 @@ class TestPerPolicyBufferClass:
         )
 
         assert RecordingBuffer.constructed_with.unused_handler_fn == unused.append
-        assert RecordingBuffer.constructed_with.args is buffer._inners["verifier"].args
+        assert RecordingBuffer.constructed_with.args is buffer._inners["verifier"]._args
 
     def test_a_policy_this_run_does_not_train_is_refused(self):
         """A typo would silently leave the policy it meant to configure on the built-in buffer."""
@@ -944,3 +982,18 @@ class TestRolloutFnContract:
         fn = make_fn(monkeypatch, make_args(rollout_batch_size=1), data_source)
 
         assert fn.constructor_input.data_source is data_source
+
+
+async def test_the_deadline_follows_the_request_budget_the_run_was_given(monkeypatch):
+    """A run told its requests may take four hours must not be failed after the floor's two."""
+    fn = make_fn(monkeypatch, make_args(sglang_router_request_timeout_secs=14400), FakeDataSource())
+
+    assert fn._no_progress_deadline_secs() == 14400
+
+
+async def test_the_deadline_never_drops_below_the_waits_the_run_already_sanctions(monkeypatch):
+    """Healing finishes no group, and a deadline inside its window would kill a recoverable run."""
+    fn = make_fn(monkeypatch, make_args(sglang_router_request_timeout_secs=60), FakeDataSource())
+
+    assert fn._no_progress_deadline_secs() == fully_async.NO_PROGRESS_DEADLINE_FLOOR_SECS
+    assert fully_async.NO_PROGRESS_DEADLINE_FLOOR_SECS > 3600

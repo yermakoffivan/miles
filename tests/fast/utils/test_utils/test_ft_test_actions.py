@@ -127,9 +127,18 @@ def test_load_actions_validates_cell_id_of_actions_outside_the_filter() -> None:
 
 
 class FakeController:
-    def __init__(self, num_cells: int, *, pool_id: str = _POOL_ID) -> None:
+    def __init__(self, num_cells: int, *, pool_id: str = _POOL_ID, observed_after_reads: int = 0) -> None:
         self.pool_id = pool_id
         self.expected_num_cells = num_cells
+        self.cell_ids_reads = 0
+        self._observed_after_reads = observed_after_reads
+
+    @property
+    def cell_ids(self) -> list[str]:
+        self.cell_ids_reads += 1
+        if self.cell_ids_reads <= self._observed_after_reads:
+            return []
+        return [f"{self.pool_id}-{index}" for index in range(self.expected_num_cells)]
 
 
 class FakeCellOperations:
@@ -186,6 +195,32 @@ class TestRunAfterStep:
 
         assert operations.started == ["trainer-engine-actor-2"]
         assert operations.stopped == []
+
+    @pytest.mark.asyncio
+    async def test_start_cell_does_not_return_until_the_controller_observes_the_cell(self):
+        """The next step reconfigures against what is observed, so returning early races the heal."""
+        operations = FakeCellOperations()
+        controller = FakeController(num_cells=2, observed_after_reads=1)
+        action = FTTestAction(at_rollout=3, action="start_cell_at_end", cell_id="trainer-engine-actor-1")
+        executor = FTTestActionControllerExecutor(actions=[action], controller=controller, cell_operations=operations)
+
+        await executor.run_after_step(3)
+
+        assert operations.started == ["trainer-engine-actor-1"]
+        assert controller.cell_ids_reads > 1, "the resume returned on the read that still lacked the cell"
+
+    @pytest.mark.asyncio
+    async def test_stop_cell_does_not_wait_for_anything_to_be_observed(self):
+        """Only the resume has a cell to wait for; making suspend wait would hang on the cell it removed."""
+        operations = FakeCellOperations()
+        controller = FakeController(num_cells=2)
+        action = FTTestAction(at_rollout=3, action="stop_cell_at_end", cell_id="trainer-engine-actor-1")
+        executor = FTTestActionControllerExecutor(actions=[action], controller=controller, cell_operations=operations)
+
+        await executor.run_after_step(3)
+
+        assert operations.stopped == ["trainer-engine-actor-1"]
+        assert controller.cell_ids_reads == 0
 
     @pytest.mark.asyncio
     async def test_start_cell_after_that_cell_was_dropped_still_targets_it(self):
@@ -261,7 +296,7 @@ class TestRunAfterStep:
     async def test_the_index_one_past_the_last_cell_is_rejected(self):
         """Cell indices are half-open, so index N of an N-cell pool is the easiest off-by-one to write in CI config."""
         operations = FakeCellOperations()
-        action = FTTestAction(at_rollout=1, action="stop_cell_at_end", cell_id="trainer-actor-3")
+        action = FTTestAction(at_rollout=1, action="stop_cell_at_end", cell_id="trainer-engine-actor-3")
         executor = FTTestActionControllerExecutor(
             actions=[action], controller=FakeController(num_cells=3), cell_operations=operations
         )
@@ -280,8 +315,8 @@ class TestRunAfterStep:
                 raise RuntimeError("worker manager rejected the stop")
 
         operations = _RejectingOperations()
-        stop_action = FTTestAction(at_rollout=7, action="stop_cell_at_end", cell_id="trainer-actor-0")
-        start_action = FTTestAction(at_rollout=7, action="start_cell_at_end", cell_id="trainer-actor-2")
+        stop_action = FTTestAction(at_rollout=7, action="stop_cell_at_end", cell_id="trainer-engine-actor-0")
+        start_action = FTTestAction(at_rollout=7, action="start_cell_at_end", cell_id="trainer-engine-actor-2")
         executor = FTTestActionControllerExecutor(
             actions=[stop_action, start_action], controller=FakeController(num_cells=3), cell_operations=operations
         )

@@ -8,6 +8,7 @@ from typing import Any
 
 _ASYNC_METHOD_NODE_IP = "_get_node_ip"
 _ASYNC_METHOD_FREE_PORT_BLOCK = "_get_free_port_block"
+_ASYNC_METHOD_PORT_AVAILABLE = "_is_port_available"
 
 READINESS_METHOD = "__ray_ready__"
 
@@ -102,6 +103,14 @@ class FakeRayModule:
             return FakeRayRemoteClass(cluster=self.cluster, actor_class=actor_class)
         return lambda cls: FakeRayRemoteClass(cluster=self.cluster, actor_class=cls, actor_options=decorator_options)
 
+    def method(self, **decorator_options: Any):
+        def _decorator(fn: Any) -> Any:
+            for name, value in decorator_options.items():
+                setattr(fn, f"__ray_{name}__", value)
+            return fn
+
+        return _decorator
+
     def get(self, ref: FakeRayObjectRef, timeout: float | None = None) -> Any:
         self.cluster.resolved_refs.append(ref.method)
         self.cluster.get_timeouts.append(timeout)
@@ -192,6 +201,8 @@ class FakeRayCluster:
             return self._alloc_port_block(
                 node_ip=handle.node_ip, start_port=kwargs["start_port"], count=kwargs["count"]
             )
+        if method == _ASYNC_METHOD_PORT_AVAILABLE:
+            return kwargs["port"] not in self._used_ports.get(handle.node_ip, set())
         return None
 
     def _alloc_port_block(self, *, node_ip: str, start_port: int, count: int) -> int:

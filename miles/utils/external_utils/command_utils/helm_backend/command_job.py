@@ -88,6 +88,10 @@ def _run_job(job: _CommandJob, *, command: list[str], capture_output: bool) -> l
 
 
 def _render_job(job: _CommandJob, *, command: list[str]) -> str:
+    # the launch path builds them on its way in, but a command job can be the first thing a run does,
+    # and a checkout carries the lock rather than the fetched subchart it pins
+    Helm.build_dependencies(job.context.chart_dir)
+
     command_job = CommandJobValues(
         enabled=True,
         name=job.step,

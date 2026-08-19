@@ -301,7 +301,7 @@ class TestKubernetesDriverAssembly:
     def test_the_watch_is_scoped_to_this_release_and_its_pools(self, monkeypatch):
         """The selector is the only thing keeping one run from healing the cells of another run's release."""
         provider = installed_cells_provider(install(monkeypatch, pods=cell_pods(2)))
-        api = fake_pod_api.installed().api
+        api = fake_pod_api.current()
 
         async def scenario():
             stop = await provider.watch_cells(_ignore_cell)
@@ -470,7 +470,7 @@ class TestKubernetesDriverAssembly:
 
         result = asyncio.run(scenario())
 
-        assert isinstance(result.inference_controller, RpcWorkerHandle)
+        assert isinstance(result.inference_controller._handle, RpcWorkerHandle)
         assert isinstance(result.rollout_executor, RpcWorkerHandle)
         assert controller.initialized
         assert executor.initialized

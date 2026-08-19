@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 _RETRY_MAX_ATTEMPTS = 30
 _CELLS_READY_TIMEOUT_SECONDS = 3600.0
+_UPDATE_WEIGHTS_TIMEOUT_SECONDS = 1200.0
+
+
+class UnreachableSnapshotError(NonRetryableError, TimeoutError):
+    """A broadcast that ran out of time: still a timeout to whoever waited, but never worth retrying."""
 
 
 def compute_trainer_health_checker_config(args, *, expected_num_cells: int) -> SimpleHealthCheckerConfig | None:
@@ -379,12 +384,28 @@ class TrainerController(NodeProbeMixin):
     async def update_weights(self, info: UpdatableEngines, rollout_id: int | None = None) -> int | None:
         """Broadcast weights to rollout engines and answer the version they now serve."""
         log_structured(logger.info, tag="ft", op="update_weights", phase="start", rollout=rollout_id)
+
+        async def broadcast_once(_: int) -> list[int | None]:
+            broadcast = asyncio.ensure_future(self._execute_first_alive("update_weights", info=info))
+            _done, pending = await asyncio.wait({broadcast}, timeout=_UPDATE_WEIGHTS_TIMEOUT_SECONDS)
+            if pending:
+                broadcast.cancel()
+                raise UnreachableSnapshotError(
+                    f"A weight broadcast did not finish in {_UPDATE_WEIGHTS_TIMEOUT_SECONDS:.0f}s, so it is waiting "
+                    f"on an engine rank that is gone. This snapshot sized the collective for that engine and can "
+                    f"never be reached again, so the update asks for a new snapshot instead"
+                )
+            # a worker rpc call raises TimeoutError of its own, and this repository classifies that one as
+            # retryable: only our own deadline, which never reaches here, means the collective is sized for an
+            # engine that is gone
+            return await broadcast
+
         # TODO: allow using all cells to update weights (instead of first alive cell)
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
-        weight_versions = await retry(
-            lambda _: self._execute_first_alive("update_weights", info=info),
-            max_attempts=_RETRY_MAX_ATTEMPTS,
-        )
+        # an engine healed mid-broadcast leaves the collective a member short, and a collective waiting on a rank
+        # nobody will start waits forever, so each attempt is bounded; a cell that raised is left to the retry,
+        # while an attempt that ran out of time leaves the snapshot to whoever owns it
+        weight_versions = await retry(broadcast_once, max_attempts=_RETRY_MAX_ATTEMPTS)
         return weight_versions[0]
 
     async def get_deployment_identity(self) -> DeploymentIdentity:

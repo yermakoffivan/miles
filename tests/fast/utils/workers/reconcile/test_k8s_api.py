@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -8,6 +9,9 @@ from pydantic import ValidationError
 
 from miles.utils.workers.k8s_types import ContainerStatus, Pod, PodMetadata, PodStatus
 from miles.utils.workers.reconcile.k8s_api import PodWatchEvent, exception_rejects_cursor
+
+
+STARTED_AT = datetime(2026, 1, 1, 12, 0, 0)
 
 
 def make_exception(**fields: Any) -> Exception:
@@ -104,6 +108,36 @@ class TestPodParsing:
         assert event.pod is not None
         assert (event.pod.spec.scheduling_gates, event.pod.spec.node_selector) == ([], {})
 
+    def test_a_running_container_the_client_deserialized_is_read_as_running(self) -> None:
+        """The client hands the running block back as a nested object rather than a mapping, and a
+        state miles cannot parse poisons every frame from the moment a container starts, which is
+        every frame the reconcile loop is watching for."""
+        obj = make_wire_pod()
+        obj.status.container_statuses = [
+            SimpleNamespace(
+                restart_count=0, state=SimpleNamespace(running=SimpleNamespace(started_at=STARTED_AT), terminated=None)
+            )
+        ]
+
+        event = PodWatchEvent.from_frame(event_type="ADDED", obj=obj)
+
+        assert event.pod is not None
+        running = event.pod.status.container_statuses[0].state.running
+        assert running is not None and running.started_at == STARTED_AT
+
+    def test_a_running_container_left_as_raw_json_is_read_the_same_way(self) -> None:
+        """The two wire shapes spell the start time differently and both have to reach the model."""
+        obj = dict(
+            metadata=dict(name="pod-0", uid="uid-0"),
+            status=dict(containerStatuses=[dict(restartCount=0, state=dict(running=dict(startedAt="2026-01-01")))]),
+        )
+
+        event = PodWatchEvent.from_frame(event_type="ADDED", obj=obj)
+
+        assert event.pod is not None
+        running = event.pod.status.container_statuses[0].state.running
+        assert running is not None and running.started_at == datetime(2026, 1, 1)
+
     @pytest.mark.parametrize("event_type", ["BOOKMARK", "ERROR"])
     def test_a_frame_that_is_not_about_a_pod_carries_no_pod(self, event_type: str) -> None:
         """BOOKMARK and ERROR frames carry a bare version and a Status, and parsing them as pods would fail."""
@@ -142,6 +176,14 @@ class TestCursorRejection:
     def test_anything_else_leaves_the_cursor_alone(self, event_type: str, obj: Any) -> None:
         """Only an ERROR frame may invalidate a cursor, and only for a cursor-specific code."""
         assert not PodWatchEvent.from_frame(event_type=event_type, obj=obj).rejects_cursor
+
+    def test_an_error_frame_nobody_can_read_is_taken_at_its_worst(self) -> None:
+        """A cursor the apiserver has already rejected replays forever, so an unreadable error frame has to
+        force the relist rather than be waved through."""
+        event = PodWatchEvent.from_frame(event_type="ERROR", obj=["not an envelope at all"])
+
+        assert event.rejects_cursor
+        assert event.resource_version is None
 
     def test_a_pod_frame_carrying_a_dead_cursor_code_leaves_the_cursor_alone(self) -> None:
         """A pod whose own fields happen to spell 410 must not be read as an expired-cursor error."""

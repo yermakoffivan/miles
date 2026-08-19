@@ -243,6 +243,18 @@ class TestHealthCheckerActiveness:
         assert not srv.health_checker_activeness.get().active
 
     @pytest.mark.asyncio
+    async def test_aborting_a_weight_update_resumes_probing(self):
+        """end_update_weights resumes nothing, so a failed update used to leave its engines unprobed until a
+        prepare_rollout that a dying run never reaches."""
+        srv = _RecordingServer()
+        controller = _make_controller({"default": srv})
+
+        await controller.start_update_weights()
+        await controller.abort_update_weights()
+
+        assert srv.health_checker_activeness.get().active
+
+    @pytest.mark.asyncio
     async def test_preparing_a_rollout_resumes_probing(self):
         """Probing comes back exactly when the engines start serving traffic again."""
         srv = _RecordingServer()
@@ -379,6 +391,19 @@ def _patch_init(monkeypatch: pytest.MonkeyPatch, *, servers: dict[str, _Recordin
     monkeypatch.setattr(inference_controller_module, "resolve_router_addrs", _fake_resolve_router_addrs)
 
 
+class _RefusingWorkerProvider(_FakeWorkerProvider):
+    """A provider a run must never touch, so touching it is the failure."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    async def init(self) -> None:
+        raise AssertionError("debug_train_only must not init any worker provider")
+
+    async def watch_cells(self, reconcile: CellReconcileFn) -> StopWatchFn:
+        raise AssertionError("debug_train_only must not watch cells")
+
+
 async def _init_controller(args: Namespace, *, engine_provider: _FakeWorkerProvider) -> None:
     controller = InferenceController(args, engine_provider=engine_provider, router_providers=[_FakeWorkerProvider([])])
     await controller.init()
@@ -510,9 +535,12 @@ class TestInitSubscription:
         assert "session-server" not in provider.watched_pool_ids
 
     @pytest.mark.asyncio
-    async def test_init_survives_a_router_cell_offered_by_the_provider(self, monkeypatch: pytest.MonkeyPatch):
-        """A router cell carries no engine meta, so a too-wide subscription kills startup in the initial sync."""
+    async def test_init_subscribes_narrowly_enough_to_never_see_a_router_cell(self, monkeypatch: pytest.MonkeyPatch):
+        """A router cell carries no engine meta, so reading one as engine meta would kill startup; the
+        controller is safe because it subscribes to the engine pools alone."""
         args = make_args()
+        assert compute_router_pool_id(0) not in compute_engine_pool_ids(args)
+
         router_info = CellInfo(
             cell_id="inference-router-0-0",
             pool_id=compute_router_pool_id(0),
@@ -522,10 +550,7 @@ class TestInitSubscription:
             meta={},
         )
         engine_info = _make_cell_info(model_id="default")
-        provider = _FakeWorkerProvider(
-            [router_info, engine_info],
-            pool_ids=[*compute_engine_pool_ids(args), compute_router_pool_id(0)],
-        )
+        provider = _FakeWorkerProvider([router_info, engine_info], pool_ids=compute_engine_pool_ids(args))
         srv = _RecordingServer()
         _patch_init(monkeypatch, servers={"default": srv})
 
@@ -876,12 +901,19 @@ class TestInitLifecycle:
         async def _no_servers(args: Namespace, **kwargs: Any) -> dict:
             raise AssertionError("debug_train_only must not create rollout servers")
 
+        async def _no_router_addrs(args: Namespace, **kwargs: Any) -> dict:
+            raise AssertionError("debug_train_only must not resolve any router")
+
         monkeypatch.setattr(inference_controller_module, "create_rollout_servers", _no_servers)
+        monkeypatch.setattr(inference_controller_module, "resolve_router_addrs", _no_router_addrs)
         monkeypatch.setattr(
             dashboard_hooks, "register_router", lambda args: pytest.fail("debug_train_only has no router")
         )
-        provider = _FakeWorkerProvider([])
-        controller = self._controller(make_args(debug_train_only=True), engine_provider=provider)
+        controller = InferenceController(
+            make_args(debug_train_only=True),
+            engine_provider=_RefusingWorkerProvider(),
+            router_providers=[_RefusingWorkerProvider()],
+        )
 
         await controller.init()
 
@@ -962,6 +994,7 @@ class TestInitLifecycle:
 
         assert registered == [args]
         assert blocked.waited_init_expected_num_cells == 1
+        assert blocked.waited_expected_num_cells == 1
 
     @pytest.mark.asyncio
     async def test_init_does_not_report_itself_initialized_before_its_fleet_is_in(self, monkeypatch):

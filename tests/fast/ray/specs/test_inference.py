@@ -529,6 +529,30 @@ class TestInferenceEngineGatedLaunch:
 
         assert recorded["gated_launch_port"] == 13007
 
+    def test_an_sglang_without_the_gate_gets_neither_the_port_nor_the_argument(self, tmp_path, monkeypatch):
+        """The engine launcher drops arguments this sglang does not know, so a cell handed a gate port
+        anyway would sit out its whole activation deadline against an engine already serving."""
+        config_path = tmp_path / "sglang.yaml"
+        config_path.write_text(
+            make_sglang_config_yaml(
+                server_groups=[{"worker_type": "regular", "num_gpus": 4, "num_gpus_per_engine": 2}]
+            )
+        )
+        args = make_args(sglang_config=str(config_path), rollout_num_gpus=4)
+        recorded: dict = {}
+
+        def _record(**kwargs) -> str:
+            recorded.update(kwargs)
+            return "launch-cmd"
+
+        monkeypatch.setattr(inference_specs, "sglang_supports_gated_launch", lambda: False)
+        monkeypatch.setattr(inference_specs, "compute_engine_launch_cmd", _record)
+        (spec,) = specs_inference_engine(args)
+        spec.launch_command(_make_engine_ctx(gate=False))
+
+        assert "gate" not in {info.name for info in spec.port_infos}
+        assert recorded["gated_launch_port"] is None
+
     def test_each_node_of_a_multi_node_engine_is_numbered_within_its_own_cell(self, tmp_path, monkeypatch):
         """node_rank is what tells sglang which member of its own two-node group a process is.
         Numbering it globally would launch the second engine as ranks 2 and 3 of a two-node
@@ -555,7 +579,7 @@ class TestInferenceEngineGatedLaunch:
         assert recorded == [0, 1, 0, 1]
 
 
-def _make_engine_ctx(*, cell_index: int = 0, worker_in_cell_index: int = 0) -> LaunchCommandContext:
+def _make_engine_ctx(*, cell_index: int = 0, worker_in_cell_index: int = 0, gate: bool = True) -> LaunchCommandContext:
     return LaunchCommandContext(
         cell_index=cell_index,
         worker_in_cell_index=worker_in_cell_index,
@@ -564,7 +588,7 @@ def _make_engine_ctx(*, cell_index: int = 0, worker_in_cell_index: int = 0) -> L
             dist_init=HostAndPort(host="10.0.0.1", port=9000),
             nccl=HostAndPort(host="10.0.0.1", port=10000),
             engine_info_bootstrap=HostAndPort(host="10.0.0.1", port=12000),
-            gate=HostAndPort(host="10.0.0.1", port=13007),
+            **(dict(gate=HostAndPort(host="10.0.0.1", port=13007)) if gate else {}),
         ),
         spec_addrs={},
         gpu_ids=[0, 1],
@@ -731,7 +755,8 @@ class TestSpecInferenceController:
         assert SECTION_OF_CATEGORY[spec.category] == "staticWorkers"
         assert entry["name"] == INFERENCE_CONTROLLER_POOL_ID
         assert entry["ports"] == [{"name": "rpc", "port": 8000}]
-        assert INFERENCE_CONTROLLER_WORKER_CLASS in entry["command"]
+        assert entry["command"][entry["command"].index("--pool-id") + 1] == INFERENCE_CONTROLLER_POOL_ID
+        assert spec.worker_class == INFERENCE_CONTROLLER_WORKER_CLASS
         assert "resources" not in entry
 
     def test_it_asks_for_a_provider_over_the_engine_pools_it_will_observe(self, tmp_path):

@@ -1,11 +1,22 @@
+import contextlib
 import random
-from collections.abc import Callable
-from unittest.mock import MagicMock
+from collections.abc import Callable, Iterator
+from unittest.mock import MagicMock, patch
 
-from tests.e2e.ft.conftest_ft.fault_injection import fault_forms, state
+from tests.e2e.ft.conftest_ft.fault_injection import core, fault_forms, state
 
 from miles.utils.external_utils import command_utils
 from miles.utils.workers.types import ClusterBackend
+
+
+@contextlib.contextmanager
+def patched_requests() -> Iterator[MagicMock]:
+    # the loop lists cells through core and injects through fault_forms, so a mock on core alone
+    # leaves every injection reaching the real network and timing out against a host nobody serves
+    mock_requests = MagicMock()
+    with patch.object(core, "requests", mock_requests), patch.object(fault_forms, "requests", mock_requests):
+        yield mock_requests
+
 
 NAMESPACE = "miles-e2e"
 RUN_ID = "abc123"

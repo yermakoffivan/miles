@@ -1,8 +1,9 @@
 import argparse
+import contextlib
 import dataclasses
 import json
 import shlex
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, TypeVar
 
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
@@ -76,10 +77,20 @@ def render_cli_argv(
             continue
         argv.extend(render(name, value))
 
-    parsed = from_parsed(make_parser().parse_args(argv))
+    parsed = from_parsed(_parse_without_exiting(make_parser(), argv))
     mismatch = _describe_mismatch(parsed, expected_obj, uncompared_fields=uncompared_fields)
     assert not mismatch, f"cli argv roundtrip mismatch on {mismatch}"
     return argv
+
+
+def _parse_without_exiting(parser: argparse.ArgumentParser, argv: list[str]) -> argparse.Namespace:
+    # argparse answers a value it will not accept by exiting the process, and this runs inside the
+    # worker that is launching the command, so an unrenderable value would take the worker down
+    # past every handler that reports one, leaving the run waiting on an engine nobody is starting
+    try:
+        return parser.parse_args(argv)
+    except SystemExit as exiting:
+        raise AssertionError(f"the argument parser rejects the rendered {shlex.join(argv)}") from exiting
 
 
 def _describe_mismatch(parsed: _ArgsT, wanted: _ArgsT, *, uncompared_fields: frozenset[str]) -> str:
@@ -181,7 +192,8 @@ def _boolean_option_string(action: argparse.Action, *, value: bool) -> str:
 
 def parse_declared_args(text: str, *, parser: argparse.ArgumentParser) -> dict[str, object]:
     tokens = shlex.split(text)
-    namespace, unknown = parser.parse_known_args(tokens)
+    with requirements_relaxed(parser):
+        namespace, unknown = parser.parse_known_args(tokens)
     assert not unknown, f"the argument parser does not declare {unknown} of {text!r}"
 
     action_by_option_string = parser._option_string_actions
@@ -266,6 +278,24 @@ def _compute_dest_of_option_names(parser: argparse.ArgumentParser) -> dict[str, 
 def _compute_arg_spec(action: argparse.Action) -> _ArgSpec:
     choices = None if action.choices is None else tuple(action.choices)
     return _ArgSpec(dest=action.dest, type=_compute_arg_type(action), choices=choices)
+
+
+@contextlib.contextmanager
+def requirements_relaxed(parser: argparse.ArgumentParser) -> Iterator[None]:
+    # a model script names an architecture, not a whole run, so the arguments a run is required to
+    # carry are not its to supply; leaving them enforced makes argparse exit the process outright
+    required = [action for action in parser._actions if action.required]
+    for action in required:
+        action.required = False
+    try:
+        yield
+    finally:
+        for action in required:
+            action.required = True
+
+
+def compute_arg_types(parser: argparse.ArgumentParser) -> dict[str, type]:
+    return {action.dest: _compute_arg_type(action) for action in parser._actions}
 
 
 def _compute_arg_type(action: argparse.Action) -> type:

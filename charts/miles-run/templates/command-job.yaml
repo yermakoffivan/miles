@@ -24,6 +24,13 @@ metadata:
     {{- include "miles-run.labels" (dict "context" . "component" .Values.commandJob.name) | nindent 4 }}
 spec:
   backoffLimit: 0
+  # a job that never retries counts an eviction against its one attempt, so a step the cluster
+  # displaced before it ran would be reported as a step that ran and failed
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
   activeDeadlineSeconds: {{ .Values.commandJob.activeDeadlineSeconds }}
   ttlSecondsAfterFinished: {{ .Values.commandJob.ttlSecondsAfterFinished }}
   completions: {{ .Values.commandJob.completions }}

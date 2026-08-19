@@ -119,32 +119,10 @@ class TestPolicyCompletion:
 
         finished = [call.kwargs["model_id"] for call in context["inference_controller"].prepare_eval.await_args_list]
         assert sorted(finished) == ["a", "b"]
+
+
 async def _slow_train(rollout_id: int, rollout_data_ref, **kwargs) -> None:
     await asyncio.sleep(0.05)
-
-
-class TestInitialWeightPublication:
-    async def test_every_policy_compares_its_engines_against_its_own_trainer(self):
-        """--ci-test asks for this comparison, and running it for one policy would leave the others unchecked."""
-        context = await _run(_make_args(num_rollout=0, check_weight_update_equal=True))
-
-        compared = [call.kwargs["model_id"] for call in context["inference_controller"].check_weights.await_args_list]
-        assert sorted(compared) == ["a", "b"]
-
-    async def test_a_run_that_does_not_ask_for_the_comparison_does_not_pay_for_it(self):
-        """The comparison walks every parameter, so it stays off unless the run turns it on."""
-        context = await _run(_make_args(num_rollout=0))
-
-        context["inference_controller"].check_weights.assert_not_awaited()
-
-
-class TestPolicyCompletion:
-    async def test_a_policy_that_finished_hands_its_engines_back_to_the_health_checker(self):
-        """Its last round paused probing for a weight update that no later rollout of its own would resume."""
-        context = await _run(_make_args(num_rollout=1))
-
-        finished = [call.kwargs["model_id"] for call in context["inference_controller"].prepare_eval.await_args_list]
-        assert sorted(finished) == ["a", "b"]
 
 
 class TestRunPolicies:

@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncGenerator
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
+
+from pydantic import BaseModel, ValidationError
 
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
 from miles.utils.workers.k8s_types import Pod, WatchFrame
 
 logger = logging.getLogger(__name__)
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 _CURSOR_REJECTED_CODES = (410, 504)
 _CURSOR_REJECTED_REASONS = ("Expired", "Gone")
@@ -35,12 +39,19 @@ class PodWatchEvent(FrozenStrictBaseModel):
 
     @classmethod
     def from_frame(cls, *, event_type: str, obj: Any) -> PodWatchEvent:
-        frame = WatchFrame.model_validate(obj)
+        # a frame whose envelope will not parse cannot say where it sits, so the cursor stays where it
+        # was and a reconnect replays from the last readable position; the repeated upserts that follow
+        # are idempotent, which is the cheaper of the two ways to be wrong here. an error frame is the
+        # one exception: an unreadable one may be the expiry only a relist can clear, and a cursor the
+        # apiserver has already rejected replays forever, so it is read at its worst. a pod frame is
+        # deliberately not tolerated, because a watch that cannot read its pods has nothing to report
+        frame = _validated_or_none(WatchFrame, obj)
+        is_error = event_type == EVENT_TYPE_ERROR
         return cls(
             type=event_type,
             pod=Pod.model_validate(obj) if event_type in POD_EVENT_TYPES else None,
-            resource_version=frame.metadata.resource_version,
-            rejects_cursor=event_type == EVENT_TYPE_ERROR and _frame_rejects_cursor(frame),
+            resource_version=frame.metadata.resource_version if frame is not None else None,
+            rejects_cursor=is_error and (frame is None or _frame_rejects_cursor(frame)),
         )
 
 
@@ -89,6 +100,14 @@ async def _close_quietly(closing: Any) -> None:
 
 def exception_rejects_cursor(exception: BaseException) -> bool:
     return getattr(exception, "status", None) in _CURSOR_REJECTED_CODES
+
+
+def _validated_or_none(model: type[ModelT], obj: Any) -> ModelT | None:
+    try:
+        return model.model_validate(obj)
+    except ValidationError:
+        logger.warning(f"a watch frame carries no readable {model.__name__} envelope ({obj=})")
+        return None
 
 
 def _frame_rejects_cursor(frame: WatchFrame) -> bool:

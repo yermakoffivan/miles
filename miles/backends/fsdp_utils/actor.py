@@ -202,7 +202,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.weight_updater = (
             UpdateWeightFromTensor(self.args, self.model)
-            if self.args.colocate
+            if self.args.update_weights_over_cuda_ipc
             else UpdateWeightFromDistributed(self.args, self.model)
         )
 

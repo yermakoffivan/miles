@@ -7,11 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from tests.fast.fixtures.capability_fixtures import FakeBackendCapability
-from tests.fast.fixtures.megatron_config_fixtures import (
-    encode_megatron_config,
-    write_megatron_config,
-    write_megatron_config_trainers,
-)
+from tests.fast.fixtures.megatron_config_fixtures import write_megatron_config, write_megatron_config_trainers
 from tests.fast.ray.rollout.conftest import make_args_with_sglang_config
 
 from miles.backends.megatron_utils.megatron_config import compute_trainer_args
@@ -20,7 +16,6 @@ from miles.ray.specs.train import (
     TRAINER_CONCURRENCY_GROUPS,
     TRAINER_CONTROLLER_WORKER_CLASS,
     _compute_trainer_controller_provider,
-    compute_actor_args,
     compute_trainer_configs,
     compute_trainer_controller_pool_id,
     compute_trainer_ids,
@@ -34,7 +29,7 @@ from miles.ray.specs.train import (
 from miles.ray.train_actor import TrainRayActor
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.builder import build_values
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import SECTION_OF_CATEGORY, LaunchPlan
-from miles.utils.workers.rpc.common.metadata import _find_rpc_config
+from miles.utils.workers.rpc.common.metadata import _find_rpc_config, declared_concurrency_groups
 from miles.utils.workers.worker_spec import WorkerCtorContext
 
 
@@ -153,7 +148,6 @@ class TestScheduling:
     def test_independent_dp_critic_cells_use_the_critic_gpu_shape(self, monkeypatch):
         """A critic sized differently from the actor must be split by its own GPU count."""
         monkeypatch.setattr("miles.ray.specs.train.compute_megatron_world_size_except_dp", lambda _args: 2)
-        monkeypatch.setattr("miles.ray.specs.train._create_indep_dp_store_addr", lambda: "10.0.0.1:1234")
 
         _actor_spec, critic_spec = specs_trainer(
             _make_args(
@@ -293,13 +287,10 @@ class TestConcurrencyGroups:
         assert spec.concurrency_groups == {"heartbeat_status": 1, "default": 1, "fault_injector": 1, "kill_self": 1}
 
     def test_the_isolated_methods_are_annotated_on_the_actor(self):
-        """Dropping a @ray.method annotation would silently queue that call behind a train step."""
-        annotations: dict[str, str | None] = {
-            name: getattr(getattr(TrainRayActor, name), "__ray_concurrency_group__", None)
-            for name in ("get_heartbeat_status", "inject_fault", "kill_self")
-        }
+        """Dropping an @rpc concurrency group would silently queue that call behind a train step."""
+        declared = declared_concurrency_groups(TrainRayActor)
 
-        assert annotations == {
+        assert {name: declared.get(name) for name in ("get_heartbeat_status", "inject_fault", "kill_self")} == {
             "get_heartbeat_status": "heartbeat_status",
             "inject_fault": "fault_injector",
             "kill_self": "kill_self",
@@ -307,11 +298,7 @@ class TestConcurrencyGroups:
 
     def test_every_annotated_group_is_declared(self):
         """Ray rejects an actor whose method names a concurrency group the class never declares."""
-        annotated_groups: set[str] = {
-            group
-            for member in vars(TrainRayActor).values()
-            if (group := getattr(member, "__ray_concurrency_group__", None)) is not None
-        }
+        annotated_groups: set[str] = set(declared_concurrency_groups(TrainRayActor).values())
 
         assert annotated_groups
         assert annotated_groups <= set(TRAINER_CONCURRENCY_GROUPS)
@@ -464,7 +451,7 @@ class TestPorts:
 @pytest.mark.parametrize("role", ["actor", "critic"])
 def test_the_pool_name_encodes_the_role(role):
     """Spec names identify trainer cells apart from inference cells."""
-    assert compute_trainer_pool_id(role) == f"trainer-{role}"
+    assert compute_trainer_pool_id(role) == f"trainer-engine-{role}"
 
 
 class _FakeStaticProvider:
@@ -532,7 +519,9 @@ class TestSpecTrainerController:
         assert SECTION_OF_CATEGORY[spec.category] == "staticWorkers"
         assert entry["name"] == "trainer-controller-actor"
         assert entry["ports"] == [{"name": "rpc", "port": 8000}]
-        assert TRAINER_CONTROLLER_WORKER_CLASS in entry["command"]
+        assert "--pool-id" in entry["command"]
+        assert entry["command"][entry["command"].index("--pool-id") + 1] == "trainer-controller-actor"
+        assert spec.worker_class == TRAINER_CONTROLLER_WORKER_CLASS
         assert "resources" not in entry
 
     def test_it_asks_for_a_provider_over_its_own_trainer_pool(self):
@@ -597,15 +586,6 @@ class TestSpecTrainerController:
     def test_the_controller_pool_name_encodes_the_role(self):
         """The two controllers of a critic run must not collide in the address book."""
         assert compute_trainer_controller_pool_id("critic") == "trainer-controller-critic"
-
-
-class TestComputeActorArgs:
-    def test_a_config_naming_several_actors_cannot_be_collapsed_to_one(self):
-        """train_async.py trains one actor; a run naming several must be started through train_multi_policy.py."""
-        args = _make_args(megatron_config=encode_megatron_config("a", "b"))
-
-        with pytest.raises(ValueError):
-            compute_actor_args(args)
 
 
 class TestTrainerConfigs:

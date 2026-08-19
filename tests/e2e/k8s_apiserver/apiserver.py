@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import socket
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from miles.utils.misc import exec_command
+from tests.e2e.exec_utils import exec_command
+
+from miles.utils.external_utils.command_utils.common import run_process
 
 logger = logging.getLogger(__name__)
+
 
 _ETCD_IMAGE = "registry.k8s.io/etcd:3.5.15-0"
 _APISERVER_IMAGE = "registry.k8s.io/kube-apiserver:v1.31.4"
@@ -18,6 +24,8 @@ _KEY_MOUNT_DIR = "/etc/miles-k8s"
 _SERVICE_ACCOUNT_KEY = "service-account.key"
 _TOKEN_FILE = "token.csv"
 _TOKEN = "miles-k8s-test-token"
+_IMAGE_PULL_ATTEMPTS = 4
+_IMAGE_PULL_BACKOFF_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -41,13 +49,16 @@ def start_apiserver(*, run_id: str, work_dir: Path, watch_cache: bool = True) ->
     try:
         exec_command(f"openssl genrsa -out {work_dir / _SERVICE_ACCOUNT_KEY} 2048")
         (work_dir / _TOKEN_FILE).write_text(f"{_TOKEN},miles-test,miles-test-uid,system:masters\n")
+        # the registry resets a connection often enough to fail a whole module on one attempt, and an
+        # image left to a docker run's implicit pull reports the reset as a container that would not start
+        _pull_image(_ETCD_IMAGE)
+        _pull_image(_APISERVER_IMAGE)
         exec_command(f"docker network create {network_name}")
         exec_command(
             f"docker run --detach --name {etcd_name} --network {network_name} {_ETCD_IMAGE} "
             f"etcd --data-dir /tmp/etcd "
             f"--advertise-client-urls http://0.0.0.0:2379 --listen-client-urls http://0.0.0.0:2379"
         )
-        exec_command(f"docker pull --quiet {_APISERVER_IMAGE}")
         host_port = _free_host_port()
         exec_command(
             f"docker run --detach --name {apiserver_name} --network {network_name} "
@@ -65,6 +76,18 @@ def start_apiserver(*, run_id: str, work_dir: Path, watch_cache: bool = True) ->
     except BaseException:
         _remove_environment_idempotently(apiserver_name=apiserver_name, etcd_name=etcd_name, network_name=network_name)
         raise
+
+
+def _pull_image(image: str) -> None:
+    for attempt in range(1, _IMAGE_PULL_ATTEMPTS + 1):
+        try:
+            exec_command(f"docker pull --quiet {image}")
+            return
+        except subprocess.CalledProcessError:
+            if attempt == _IMAGE_PULL_ATTEMPTS:
+                raise
+            logger.warning(f"Pulling {image} failed on attempt {attempt}/{_IMAGE_PULL_ATTEMPTS}; retrying")
+            time.sleep(_IMAGE_PULL_BACKOFF_SECONDS * attempt)
 
 
 def stop_apiserver(environment: ApiserverEnvironment) -> None:
@@ -88,7 +111,8 @@ def _remove_environment_idempotently(*, apiserver_name: str, etcd_name: str, net
 
 def log_apiserver_diagnostics(environment: ApiserverEnvironment) -> None:
     for container in (environment.apiserver_name, environment.etcd_name):
-        logs = exec_command(f"docker logs --tail 50 {container} 2>&1", capture_output=True)
+        completed = run_process(shlex.split(f"docker logs --tail 50 {container}"), capture_output=True, check=False)
+        logs = f"{completed.stdout}{completed.stderr}"
         logger.error(f"apiserver environment diagnostics {container=}\n{logs}")
 
 

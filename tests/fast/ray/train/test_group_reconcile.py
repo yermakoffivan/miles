@@ -137,7 +137,7 @@ class TestPublicCellInventory:
         assert group.num_cells == 3
         assert group.cell_ids == [f"{_POOL_ID}-{cell_index}" for cell_index in range(3)]
 
-        statuses = group.get_cell_statuses()
+        statuses = await group.get_cell_statuses()
         assert sorted(statuses) == group.cell_ids
         assert [status.phase for status in statuses.values()] == ["Running"] * 3
         assert _healthy_condition(statuses[f"{_POOL_ID}-0"]) == (TriState.TRUE, None)

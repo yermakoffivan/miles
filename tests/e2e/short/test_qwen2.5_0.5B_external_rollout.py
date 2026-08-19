@@ -202,9 +202,11 @@ def _engines_installed_beside_the_run(helm_values: tuple[str, ...]) -> _External
 
 
 def _ray_engines_launch_cmd(engine_devices: list[str]) -> str:
+    # a prepare command runs inside a ray task, and the engines have to outlive it: nohup only
+    # answers the hangup, so without a session of their own they are reaped with the task's group
     launches = " ".join(
-        f"CUDA_VISIBLE_DEVICES={device} nohup {shlex.join(_engine_argv(port))} "
-        f"> /tmp/miles_external_engine_{port}.log 2>&1 &"
+        f"(CUDA_VISIBLE_DEVICES={device} setsid {shlex.join(_engine_argv(port))} "
+        f"> /tmp/miles_external_engine_{port}.log 2>&1 &);"
         for device, port in zip(engine_devices, RAY_ENGINE_PORTS, strict=True)
     )
     probes = " && ".join(

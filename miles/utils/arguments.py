@@ -34,8 +34,10 @@ from miles.utils.logging_utils import configure_logger_raw
 from miles.utils.lora import is_lora_enabled
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
 from miles.utils.object_store import ObjectStoreBackend
+from miles.utils.object_store_config import compute_mooncake_init_kwargs
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
+from miles.utils.workers.argv_utils import requirements_relaxed
 from miles.utils.workers.types import ClusterBackend, DeployComponent, WorkerCommBackend, resolve_worker_comm_backend
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,11 @@ def _resolve_rollout_functions(args) -> None:
         "--eval-num-gpus and a CheckpointEvalFn --eval-function-path each select an eval "
         "backend; the fleet would boot and then hand the work to the other one."
     )
+    # asserted here rather than beside the other external-rollout topology checks, because a
+    # fleet asked for at all turns on the snapshot posture and its gate would fire first
+    assert not (
+        args.eval_num_gpus > 0 and _compute_rollout_external(args)
+    ), "eval_num_gpus cannot be set with external rollout engines."
     args.eval_uses_snapshots = args.eval_num_gpus > 0 or checkpoint_backend
 
 
@@ -1063,6 +1070,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 interval_default=30.0,
                 timeout_default=30.0,
                 first_wait_default=0.0,
+                failure_threshold_default=1,
             )
             parser.add_argument(
                 "--api-server-port",
@@ -2742,8 +2750,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_user_provided_function_arguments(parser):
+            # this reads the argv it has so far only to learn which user modules to ask for arguments,
+            # and a caller building a throwaway parser supplies no argv at all; leaving the run's own
+            # required arguments enforced makes argparse print a full usage screen and exit, which the
+            # except below then turns into a parser silently missing every argument added past here
             try:
-                args_partial, _ = parser.parse_known_args()
+                with requirements_relaxed(parser):
+                    args_partial, _ = parser.parse_known_args()
             except SystemExit:
                 return parser
             paths = [args_partial.custom_inference_engine_provider_path]
@@ -2964,6 +2977,14 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def _compute_rollout_external(args: argparse.Namespace) -> bool:
     return args.rollout_external_engine_addrs is not None or args.custom_inference_engine_provider_path is not None
+
+
+def _compute_update_weights_over_cuda_ipc(args: argparse.Namespace) -> bool:
+    # handing an engine a cuda ipc handle makes it open the sender's pid, so the two have to be in
+    # one pid namespace; colocation is what puts them there, but only because ray colocates inside a
+    # node's process space, while this backend colocates by pinning two pods to a node and a pod
+    # cannot open pids belonging to another
+    return args.colocate and ClusterBackend(args.cluster_backend) != ClusterBackend.KUBERNETES
 
 
 _BACKEND_ENGINE_PROVIDER_PATH = "miles.ray.specs.inference.backend_inference_engine_provider"
@@ -3839,6 +3860,7 @@ def miles_validate_args(args):
 
     args.rollout_external = _compute_rollout_external(args)
     args.custom_inference_engine_provider_path = _compute_custom_inference_engine_provider_path(args)
+    args.update_weights_over_cuda_ipc = _compute_update_weights_over_cuda_ipc(args)
 
     args.worker_comm_backend = resolve_worker_comm_backend(
         cluster_backend=ClusterBackend(args.cluster_backend), requested=args.worker_comm_backend
@@ -3851,6 +3873,12 @@ def miles_validate_args(args):
                 f"{ObjectStoreBackend.MOONCAKE.value} under --cluster-backend {ClusterBackend.KUBERNETES.value}."
             )
             args.object_store_backend = ObjectStoreBackend.MOONCAKE.value
+        if not args.mooncake_store_init_kwargs:
+            # this backend chose the store, not the run, so the run cannot be asked to configure it;
+            # the launcher rewrites the host to the master it starts for this release, and asserts
+            # these kwargs exist, so leaving them unset made every defaulted run die at launch
+
+            args.mooncake_store_init_kwargs = compute_mooncake_init_kwargs()
 
     args.run_uuid = _resolve_run_uuid(args)
 
@@ -3881,10 +3909,6 @@ def miles_validate_args(args):
     assert not (
         args.sglang_config is not None and args.rollout_external
     ), "sglang_config cannot be set with external rollout engines; the topology comes from discovery."
-
-    assert not (
-        args.eval_num_gpus > 0 and args.rollout_external
-    ), "eval_num_gpus cannot be set with external rollout engines."
 
     assert not (
         args.rollout_external_router_pd and not args.rollout_external

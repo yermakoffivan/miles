@@ -149,6 +149,9 @@ class ServerCell:
         return SGLangApiClient(server_url=self.server_url, api_key=self.meta.sglang_api_key)
 
     async def init(self) -> None:
+        # releasing the gate is what starts the engine, so a second init has to be refused
+        # before it reaches one that is already starting
+        assert isinstance(self._state, StateUninitialized), f"{self._state=}"
         addr_info = await self._compute_addr_info()
         if (gate_url := addr_info.gate_url) is not None:
             await activate_launch_gate(gate_url=gate_url)
@@ -217,7 +220,10 @@ class ServerCell:
         match self._state:
             case StateServing():
                 await self._unregister_from_router()
-            case StateUninitialized() | StateInitializing() | StatePendingWeights() | StateDisposed():
+                await self._give_back_gpu_memory()
+            case StatePendingWeights():
+                await self._give_back_gpu_memory()
+            case StateUninitialized() | StateInitializing() | StateDisposed():
                 pass
             case _:
                 raise ValueError(f"{self._state=}")
@@ -227,6 +233,20 @@ class ServerCell:
             (StateUninitialized, StateInitializing, StatePendingWeights, StateServing, StateDisposed),
             StateDisposed(),
         )
+
+    async def _give_back_gpu_memory(self) -> None:
+        # a colocated cell shares its gpu with the trainer, and leaving here is what takes it out of
+        # the fleet the offload pass walks, so memory it still holds is memory nobody comes back for
+        if not self.meta.needs_offload:
+            return
+
+        try:
+            await asyncio.wait_for(self.offload(tags=None), timeout=SHUTDOWN_TIMEOUT)
+        except Exception as e:
+            logger.warning(
+                f"Cell {self.meta.cell_id} did not give its gpu memory back; it may be gone already ({e})",
+                exc_info=e,
+            )
 
     async def _unregister_from_router(self) -> None:
         try:

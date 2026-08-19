@@ -117,8 +117,10 @@ class InferenceControllerEvalFleet:
                     ),
                     timeout=EVAL_WEIGHT_LOAD_TIMEOUT_SECS,
                 )
+                # a cell that joined while the load ran was never asked to load, so the
+                # membership the check reads has to be the membership as it stands now
                 versions = await asyncio.wait_for(
-                    asyncio.gather(*[client.get_weight_version() for client in clients]),
+                    asyncio.gather(*[client.get_weight_version() for client in await self._fleet_api_clients()]),
                     timeout=EVAL_WEIGHT_LOAD_TIMEOUT_SECS,
                 )
             except Exception as e:

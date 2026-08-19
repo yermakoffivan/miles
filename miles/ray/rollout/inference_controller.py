@@ -209,6 +209,16 @@ class InferenceController(NodeProbeMixin):
             ]
         )
 
+    @releases_lock
+    async def abort_update_weights(self, model_id: str | None = None) -> None:
+        # no cell may be told its weights are ready when the broadcast did not finish, but the lock has to
+        # come back all the same: reconcile waits behind it, and reconcile is what replaces the engine whose
+        # loss ended the broadcast, so a lock kept here is a fleet that can never heal
+        logger.warning("A weight update did not finish; its engines keep waiting for weights")
+        # the start of the update paused these checkers and nothing on the way out turns them back on, so a
+        # failed update left the fleet unprobed until the next prepare_rollout, which a dying run never reaches
+        await self._health_monitoring_resume(model_id)
+
     @requires_lock
     async def _ensure_cells_ready(self, model_id: str | None = None) -> None:
         deadline = time.monotonic() + CELLS_READY_TIMEOUT_SECONDS

@@ -67,6 +67,42 @@ class TestWithAllParked:
 
         assert laps_of_the_second_round > laps_of_the_first_round
 
+    async def test_a_follower_that_finished_its_rounds_is_not_waited_for(self):
+        """It can never park again, so counting it holds the whole run at the checkpoint."""
+        parker = Parker(num_followers=1)
+        with parker.running_follower():
+            pass
+
+        async def checkpoint() -> None:
+            async with parker.with_all_parked():
+                pass
+
+        await asyncio.wait_for(checkpoint(), timeout=5)
+
+    async def test_a_follower_that_left_stops_being_counted_while_the_leader_waits(self):
+        """The last rounds of two policies rarely line up, so one may leave mid wait."""
+        parker = Parker(num_followers=2)
+        leaving = parker.running_follower()
+        leaving.__enter__()
+
+        async def checkpoint() -> None:
+            async with parker.with_all_parked():
+                pass
+
+        async def stays() -> None:
+            await parker.maybe_park_follower()
+
+        checkpointing = asyncio.create_task(checkpoint())
+        await asyncio.sleep(0.05)
+        task = asyncio.create_task(stays())
+        await asyncio.sleep(0.05)
+        assert not checkpointing.done()
+
+        leaving.__exit__(None, None, None)
+
+        await asyncio.wait_for(checkpointing, timeout=5)
+        await asyncio.wait_for(task, timeout=5)
+
     async def test_waiting_for_a_follower_that_never_parks_fails_loudly(self, monkeypatch):
         """A silent hang here stalls the whole run, so the wait has to end as a failure instead."""
         monkeypatch.setattr(parker_module, "PARK_TIMEOUT_SECONDS", 0.0)

@@ -178,13 +178,12 @@ jobs:
             image=moby/buildkit:latest
             network=host
 
-      - name: Install Python + dependencies
+      - name: Install the build script's interpreter
         run: |
-          if ! command -v python3 >/dev/null || ! command -v pip3 >/dev/null; then
-            apt-get -o DPkg::Lock::Timeout=600 update
-            apt-get -o DPkg::Lock::Timeout=600 install -y python3 python3-pip
-          fi
-          pip3 install --break-system-packages --ignore-installed typer
+          # a runner shares its dpkg lock with everything else installing on the same host, so
+          # reaching for apt here makes the build wait on a stranger and then fail outright
+          command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -194,7 +193,7 @@ jobs:
 
       - name: Build and push
         run: |
-          python3 docker/build.py \
+          uv run --no-project --with typer python docker/build.py \
             --variant ${{ inputs.variant || 'cu13' }} \
             --image-tag ${{ inputs.image_tag || 'dev' }} \
             --dockerfile ${{ inputs.dockerfile || 'docker/Dockerfile' }} \
@@ -206,7 +205,7 @@ jobs:
         # image; a manual workflow_dispatch builds only the single variant the user picked.
         if: ${{ !inputs.variant }}
         run: |
-          python3 docker/build.py --variant cu12-x86 --image-tag dev --push
+          uv run --no-project --with typer python docker/build.py --variant cu12-x86 --image-tag dev --push
 
       - name: Point latest to current dev
         # schedule only: latest is published registry state, so — like prune — a [DEBUG]

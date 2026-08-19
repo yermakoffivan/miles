@@ -101,6 +101,53 @@ class TestLoraTargetModules:
 
         assert sorted(targets) == ["in_proj_ba", "in_proj_qkvz"]
 
+    def test_a_target_the_command_line_cannot_name_asks_sglang_to_discover_them(self):
+        """SGLang's LoRA runtime serves out_proj but its own --lora-target-modules choices do not
+        list it, so naming it is an engine that dies in argparse before it ever loads a model."""
+        targets = self._parsed_lora_targets(["layers.*.self_attention.in_proj", "layers.*.self_attention.out_proj"])
+
+        assert set(targets) == {"all"}
+
+    def test_a_qwen3_5_lora_run_trades_its_named_targets_for_an_engine_that_starts(self):
+        """The launch script's own list is what the Qwen3.5 LoRA CI test runs, and it contains out_proj,
+        so this is the run that pays for the shorthand: the seven spellable names are given up too,
+        because SGLang takes `all` only on its own. The alternative on offer is an engine that dies in
+        argparse, and dropping just the unlisted name would make SGLang skip the adapter tensors the
+        trainer still ships for it."""
+        from scripts.run_qwen3_5_35b_a3b_lora import _DEFAULT_TARGET_MODULES
+
+        named = _DEFAULT_TARGET_MODULES.split(",")
+
+        assert self._parsed_lora_targets(named) == ["all"]
+
+        spellable = [name for name in named if not name.endswith("out_proj")]
+        assert sorted(self._parsed_lora_targets(spellable)) == [
+            "down_proj",
+            "gate_proj",
+            "in_proj_ba",
+            "in_proj_qkvz",
+            "k_proj",
+            "o_proj",
+            "q_proj",
+            "up_proj",
+            "v_proj",
+        ]
+
+    def test_a_multi_lora_launch_also_gives_up_its_targets_for_an_unnameable_one(self):
+        """Several adapters share one slot budget here, so the shorthand sizes that budget off the base
+        model rather than off what the adapters fill. That cost is accepted only because the run does
+        not start at all otherwise; it must not creep in for targets that can be named."""
+        args = make_engine_args(
+            lora_rank=16,
+            target_modules=["layers.*.self_attention.in_proj", "layers.*.self_attention.out_proj"],
+            multi_lora=True,
+            multi_lora_n_adapters=4,
+        )
+
+        targets = parse_server_args_argv(shlex.split(_cmd(args=args))[3:]).lora_target_modules
+
+        assert set(targets) == {"all"}
+
     def test_an_inkling_checkpoint_asks_sglang_to_discover_the_names(self, monkeypatch: pytest.MonkeyPatch):
         """Inkling exposes module names the megatron-to-HF mapping cannot produce, so it is the
         one family that hands SGLang the shorthand instead of naming its targets."""

@@ -60,8 +60,14 @@ class ContainerStateTerminated(FrozenPartialBaseModel):
     container_id: str | None = Field(default=None, validation_alias=AliasChoices("container_id", "containerID"))
 
 
+class ContainerStateRunning(FrozenPartialBaseModel):
+    started_at: datetime | None = Field(default=None, validation_alias=AliasChoices("started_at", "startedAt"))
+
+
 class ContainerState(FrozenPartialBaseModel):
-    running: dict[str, Any] | None = None
+    # the client hands back a deserialized object rather than the raw json, so every nested block
+    # has to be a model of its own; a bare mapping here reads the running container as unparseable
+    running: ContainerStateRunning | None = None
     terminated: ContainerStateTerminated | None = None
 
 

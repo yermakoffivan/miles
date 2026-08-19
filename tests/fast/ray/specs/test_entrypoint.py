@@ -7,11 +7,19 @@ from tests.fast.fixtures.megatron_config_fixtures import encode_megatron_config
 from tests.fast.ray.rollout.conftest import make_args, make_args_with_sglang_config, make_sglang_config_yaml
 
 from miles.ray.specs.entrypoint import compute_specs
-from miles.ray.specs.inference import INFERENCE_REGISTRATION_REPORTER_POOL_ID
+from miles.ray.specs.inference import INFERENCE_REGISTRATION_REPORTER_POOL_ID, compute_router_providers
 from miles.utils.workers.types import DeployComponent
 from miles.utils.workers.worker_provider.kubernetes.helm.builder import compute_helm_backend_capability
 from miles.utils.workers.worker_provider.kubernetes.helm.env import NAMESPACE_ENV_VAR, RELEASE_ENV_VAR
 from miles.utils.workers.worker_spec import WorkerCtorContext
+
+
+def _capability_that_refuses_to_be_used():
+    class _Unusable:
+        def static_worker_provider(self, *, pool_id):
+            raise AssertionError(f"a train-only run asked for a worker provider for {pool_id!r}")
+
+    return _Unusable()
 
 
 class TestComputeSpecs:
@@ -39,9 +47,24 @@ class TestComputeSpecs:
             "session-server",
             "inference-engine-all-0-0",
             "inference-engine-all-0-2",
+            "inference-engine-0-0",
+            "inference-engine-0-2",
             "trainer-controller-actor",
             "trainer-engine-actor",
         ]
+
+    def test_a_train_only_debug_run_specs_no_inference_at_all(self):
+        """--debug-train-only leaves --rollout-num-gpus unset, so anything that sizes an engine
+        fleet from it cannot even be built, let alone launched."""
+        args = make_args(rollout_num_gpus=None, debug_train_only=True, use_session_server=True)
+
+        specs = {spec.name: spec for spec in compute_specs(args)}
+
+        assert not [name for name in specs if name.startswith(("inference-router", "inference-engine"))]
+        assert specs["session-server"].scheduling.num_cells == 0
+        # the controller resolves the same config again inside its own actor, where a failure
+        # is a dead actor rather than a readable error at launch
+        assert compute_router_providers(args, capability=_capability_that_refuses_to_be_used()) == []
 
     def test_a_disabled_session_server_is_listed_with_no_cells(self, tmp_path):
         """Disabling the session server must not remove it from the inventory, only empty it."""

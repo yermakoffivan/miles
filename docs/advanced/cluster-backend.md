@@ -61,6 +61,31 @@ python -m miles.utils.external_utils.miles_workbench uninstall -n "$MILES_NS"
 
 `stop` removes the run and frees its GPUs; `uninstall` removes the workbench.
 
+## Colocated engines
+
+Under `--colocate` the trainer asks for whole nodes and the engines ask for no GPU at all: a
+scheduling gate holds each engine pod until the trainer it shares with has landed, and a pairing
+controller then pins it to that node.
+
+Engines narrower than a node are fine — eight `--rollout-num-gpus-per-engine 1` engines share one
+8-GPU trainer node. Such an engine sees every card on the node, so it is told at startup which one
+is its own, computed from the pod's own position rather than rendered into the command.
+
+Each pool pod gets a memory-backed `/dev/shm`, the same shared memory the docker quick start asks
+for with `--shm-size`. Kubernetes' own default is 64Mi, and NCCL wants tens of Mi for every peer it
+cannot reach over p2p, so a pool holding part of a node's cards would otherwise die at rendezvous
+with `No space left on device`.
+
+Three limits remain:
+
+- The trainer still takes whole nodes. A trainer pod narrower than a node is refused.
+- An engine cannot be wider than a node, since nothing would place the half of it that reaches
+  past the node it is pinned to.
+- Losing one of several narrow engines ends the run. The pairing controller does put the replacement
+  pod back on the trainer's node, but the weight update that runs while it is away waits on a rank
+  that is not coming, and a trainer of a single cell has no second cell to retry from. A run of one
+  whole-node engine does not hit this: losing that engine leaves none to broadcast to at all.
+
 ## Folder convention
 
 A run is many pods on many machines, and they share nothing but the storage `infra.yaml` mounts.
@@ -68,6 +93,9 @@ A path that is not on it is the most common way a run fails.
 
 - Every path your script names — `/root/models`, `/root/datasets` — has to be on it.
 - Copying a file into a pod is pointless: pods come and go, the mount survives.
+- A `hostPath` has to hold on every node a pod can land on. Where only part of the cluster mounts
+  the share, say so in `infra.scheduling.nodeSelector`: a node that has the directory but not the
+  filesystem under it takes the writes onto its own disk, and the run reads an empty share back.
 - To run your own branch instead of the image's copy, name its sub-path under the storage root:
   `infra.paths.repos.miles: alice/miles`. `megatron` and `sglang` work the same way.
 

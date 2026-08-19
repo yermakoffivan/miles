@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,21 +9,22 @@ import ray
 from tests.fast.ray.train import conftest as train_conftest
 from tests.fast.ray.train.conftest import get_raw_actor_handles, make_deployment_identity, make_provider
 
+import miles.ray.train.group as group_module
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
-from miles.ray.train.group import TrainerController, compute_trainer_health_checker_config
+from miles.ray.train.group import TrainerController, UnreachableSnapshotError, compute_trainer_health_checker_config
 from miles.utils import object_store
 from miles.utils.audit_utils.event_logger.logger import EventLogger, read_events, set_event_logger
 from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.audit_utils.witness.allocator import WitnessIdAllocator
 from miles.utils.data import RolloutDataPack
-from miles.utils.object_store import StoreObjectRef
+from miles.utils.object_store import _MooncakeStoreObjectRef
 from miles.utils.ray_utils import Box
 from miles.utils.retry_utils import NonRetryableError
 
 pytestmark = pytest.mark.asyncio
 
-_DUMMY_DATA_PACK = RolloutDataPack(sample_indices=[0], data_ref=StoreObjectRef(payload="data"))
+_DUMMY_DATA_PACK = RolloutDataPack(sample_indices=[0], data_ref=_MooncakeStoreObjectRef(payload="data"))
 
 
 def _make_mock_args(
@@ -81,7 +83,7 @@ def _make_controller(
         with_ref=with_ref,
         with_opd_teacher=with_opd_teacher,
         cell_provider=make_provider(),
-        cell_operations=MagicMock(),
+        cell_operations=AsyncMock(),
     )
     group.args = _make_mock_args(
         indep_dp=True,
@@ -92,6 +94,8 @@ def _make_controller(
     group._health_checker_config = compute_trainer_health_checker_config(
         group.args, expected_num_cells=group._expected_num_cells
     )
+    if group._expected_num_cells > 1:
+        group._indep_dp_store, group._indep_dp_store_addr = group_module.create_tcp_store()
     for cell_index in range(num_cells):
         cell = group._create_cell(
             f"{group._pool_id}-{cell_index}", cell_index=cell_index, workers_hash="pseudo-hash-1"
@@ -161,12 +165,13 @@ class TestInit:
     def test_the_controller_watches_the_pool_of_its_trainer_id(self):
         """A policy's controller owns the pool named after its trainer id, which the role no longer determines."""
         group = TrainerController(
+            deployment_identity=make_deployment_identity(),
             trainer_id="alpha-actor",
             role="actor",
             with_ref=False,
             with_opd_teacher=False,
             cell_provider=make_provider(),
-            cell_operations=MagicMock(),
+            cell_operations=AsyncMock(),
         )
 
         assert group._pool_id == "trainer-engine-alpha-actor"
@@ -1109,7 +1114,7 @@ class TestLogStepEndEvent:
 
 
 class TestCellStatusesUnderConcurrentReconcile:
-    def test_a_cell_removed_while_the_statuses_are_read_does_not_abort_the_read(self):
+    async def test_a_cell_removed_while_the_statuses_are_read_does_not_abort_the_read(self):
         """The api server reads this from its own thread while reconcile adds and drops cells,
         and iterating the live dict raises RuntimeError instead of answering the request."""
         controller = _make_controller(num_cells=3)
@@ -1123,7 +1128,7 @@ class TestCellStatusesUnderConcurrentReconcile:
 
         controller._cells_by_id[f"{controller._pool_id}-0"] = _EvictingCell()
 
-        statuses = controller.get_cell_statuses()
+        statuses = await controller.get_cell_statuses()
 
         # The snapshot is taken before the first cell_status() call, so the evicted cell is still
         # answered for. What matters is that the read completes instead of raising.
@@ -1159,6 +1164,61 @@ class TestUpdateWeightsReturnsTheVersion:
         group._execute_first_alive.assert_awaited_once_with("update_weights", info=info)
 
 
+class TestUpdateWeightsIsBoundedPerSnapshot:
+    def _make_group(self, *, broadcast: AsyncMock) -> TrainerController:
+        group = TrainerController.__new__(TrainerController)
+        group.args = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, trainer_model_id=None)
+        group._execute_first_alive = broadcast
+        return group
+
+    async def test_a_broadcast_that_never_answers_is_given_up_on_rather_than_waited_out(self):
+        """An engine healed mid-broadcast leaves the collective a member short, and a collective waiting on a
+        rank nobody will start waits forever, so without a bound the run stops with every cell reporting healthy."""
+        never_answers = asyncio.Event()
+
+        async def _hang(*_args, **_kwargs):
+            await never_answers.wait()
+
+        group = self._make_group(broadcast=AsyncMock(side_effect=_hang))
+
+        with patch.object(group_module, "_UPDATE_WEIGHTS_TIMEOUT_SECONDS", 0.05):
+            with pytest.raises(UnreachableSnapshotError):
+                await asyncio.wait_for(group.update_weights(info=MagicMock()), timeout=5.0)
+
+    async def test_a_timed_out_broadcast_is_not_waited_on_again_under_the_same_snapshot(self):
+        """Deliberately without patching _RETRY_MAX_ATTEMPTS: at the production 30 the resnapshot loop starved."""
+        never_answers = asyncio.Event()
+
+        async def _hang(*_args, **_kwargs):
+            await never_answers.wait()
+
+        broadcast = AsyncMock(side_effect=_hang)
+        group = self._make_group(broadcast=broadcast)
+
+        with patch.object(group_module, "_UPDATE_WEIGHTS_TIMEOUT_SECONDS", 0.01):
+            with pytest.raises(UnreachableSnapshotError):
+                await group.update_weights(info=MagicMock())
+
+        assert broadcast.await_count == 1, (
+            f"the broadcast ran {broadcast.await_count} times under one snapshot, so a snapshot that can never "
+            f"be reached again was waited on more than once"
+        )
+
+    @pytest.mark.parametrize(
+        "first_failure",
+        [RuntimeError("cell 0 is gone"), TimeoutError("the worker rpc call gave up")],
+        ids=["a cell that raised", "a worker reporting its own timeout"],
+    )
+    async def test_a_failure_that_is_not_our_own_deadline_is_retried_under_the_same_snapshot(self, first_failure):
+        """Only our own deadline means the snapshot is unreachable; a worker's own timeout is retryable here, so
+        both must find the next cell rather than ask for a new snapshot."""
+        broadcast = AsyncMock(side_effect=[first_failure, [7]])
+        group = self._make_group(broadcast=broadcast)
+
+        assert await group.update_weights(info=MagicMock()) == 7
+        assert broadcast.await_count == 2
+
+
 class TestInitForwardsModelFlags:
     async def test_every_worker_learns_its_role_and_which_extra_models_to_build(self):
         """These flags decide which models a worker allocates, so dropping one silently changes the objective."""
@@ -1177,21 +1237,21 @@ class TestInitForwardsModelFlags:
 class TestTrainRunsFTTestActions:
     async def test_train_applies_the_action_armed_for_that_rollout_before_returning(self):
         """The FT scenario's stop must have landed by the time the driver starts the next rollout."""
-        actions = json.dumps([{"at_rollout": 4, "action": "stop_cell_at_end", "cell_id": "trainer-actor-2"}])
+        actions = json.dumps([{"at_rollout": 4, "action": "stop_cell_at_end", "cell_id": "trainer-engine-actor-2"}])
         group = await _make_alive_controller(num_cells=3, ci_ft_test_actions=actions)
 
         await group.train(rollout_id=4, rollout_data_pack=_DUMMY_DATA_PACK)
 
-        assert train_conftest.fake_worker_manager.stopped_cell_ids == [["trainer-actor-2"]]
+        group._cell_operations.suspend.assert_awaited_once_with(cell_id="trainer-engine-actor-2")
 
     async def test_train_leaves_the_pool_alone_on_a_rollout_no_action_names(self):
         """An action that fires on every rollout would tear the pool down for the whole run."""
-        actions = json.dumps([{"at_rollout": 4, "action": "stop_cell_at_end", "cell_id": "trainer-actor-2"}])
+        actions = json.dumps([{"at_rollout": 4, "action": "stop_cell_at_end", "cell_id": "trainer-engine-actor-2"}])
         group = await _make_alive_controller(num_cells=3, ci_ft_test_actions=actions)
 
         await group.train(rollout_id=3, rollout_data_pack=_DUMMY_DATA_PACK)
 
-        assert train_conftest.fake_worker_manager.stopped_cell_ids == []
+        group._cell_operations.suspend.assert_not_awaited()
 
 
 class TestSaveModel:

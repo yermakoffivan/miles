@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from miles.utils.misc import exec_command
+from tests.e2e.exec_utils import exec_command
 
 logger = logging.getLogger(__name__)
 

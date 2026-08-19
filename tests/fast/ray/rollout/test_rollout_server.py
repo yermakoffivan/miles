@@ -11,7 +11,6 @@ from miles.backends.sglang_utils.sglang_config import (
     _compute_rollout_offset,
     resolve_sglang_config,
 )
-from miles.ray.rollout import rollout_server as rollout_server_module
 from miles.ray.rollout.cell_state import CellAddrInfo, StateServing
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
@@ -220,30 +219,29 @@ class TestCreateRolloutServersWiring:
     )
 
     @pytest.mark.asyncio
-    async def test_create_rollout_servers_wires_each_model_and_router_completely(self, tmp_path, monkeypatch):
-        """Every model gets its own router and its own activeness tracker, the first one is published on the legacy args, and the injected lock and update_weights survive."""
-
-        async def _wait_router_ready(model_idx: int) -> HostAndPort:
-            return HostAndPort(host=f"10.0.0.{model_idx + 1}", port=20000 + model_idx)
-
-        monkeypatch.setattr(rollout_server_module, "wait_router_ready", _wait_router_ready)
+    async def test_create_rollout_servers_wires_each_model_and_router_completely(self, tmp_path):
+        """Every model gets its own router and its own activeness tracker, and the injected lock and update_weights survive."""
 
         cfg_path = tmp_path / "cfg.yaml"
         cfg_path.write_text(self._CONFIG_YAML)
         args = make_args(sglang_config=str(cfg_path), rollout_num_gpus=12, debug_rollout_only=True)
         lock = ContextLock("InferenceControllerUnderTest")
+        router_addrs = {
+            name: HostAndPort(host=f"10.0.0.{model_idx + 1}", port=20000 + model_idx)
+            for model_idx, name in enumerate(("actor", "ref"))
+        }
 
         servers = await create_rollout_servers(
             args,
             context_lock=lock,
+            engine_provider=_StubProvider(),
+            router_addrs=router_addrs,
         )
 
         assert {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()} == {
             "actor": ("10.0.0.1", 20000),
             "ref": ("10.0.0.2", 20001),
         }
-        assert (args.sglang_router_ip, args.sglang_router_port) == ("10.0.0.1", 20000)
-        assert args.sglang_model_routers == {"actor": ("10.0.0.1", 20000), "ref": ("10.0.0.2", 20001)}
         assert [srv.model_name for srv in servers.values()] == ["actor", "ref"]
         assert (servers["actor"].update_weights, servers["ref"].update_weights) == (True, False)
         for srv in servers.values():
@@ -292,11 +290,39 @@ class TestAddCellRollback:
         )
 
     @pytest.mark.asyncio
-    async def test_a_failed_add_still_tracks_the_cell_so_nothing_leaks(self, monkeypatch):
-        """The cell is committed before init runs, so a failing init cannot orphan its health checker task."""
+    async def test_a_failed_add_disposes_the_cell_so_nothing_leaks(self, monkeypatch):
+        """A cell builds its health checker task in its constructor, so a failing init has to dispose it."""
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=False, ft_components=[]),
+            args=make_args(colocate=False, ft_components=[]),
+            context_lock=_make_lock(),
+            engine_provider=_StubProvider(),
+        )
+        disposed: list[str] = []
+        real_dispose = ServerCell.dispose
+
+        async def _recording_dispose(cell):
+            disposed.append(cell.meta.cell_id)
+            await real_dispose(cell)
+
+        monkeypatch.setattr(ServerCell, "init", _raise_async)
+        monkeypatch.setattr(ServerCell, "dispose", _recording_dispose)
+
+        async with srv.context_lock:
+            with pytest.raises(RuntimeError, match="injected init failure"):
+                await srv.add_cell(self._make_meta())
+
+            assert disposed == ["inference-engine-0-0-0"]
+            await srv.dispose()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_add_leaves_the_cell_id_free_for_the_retry(self, monkeypatch):
+        """A cell registered before its init survives its own failure: the next observation finds the id
+        already carrying the hash it observes, so the reconcile that retries has nothing left to add and
+        the half-built cell waits for weights it is never offered."""
+        srv = RolloutServer(
+            server_cells={},
+            args=make_args(colocate=False, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -306,6 +332,27 @@ class TestAddCellRollback:
             with pytest.raises(RuntimeError, match="injected init failure"):
                 await srv.add_cell(self._make_meta())
 
+            assert srv.server_cells == {}
+            await srv.dispose()
+
+    @pytest.mark.asyncio
+    async def test_the_retry_after_a_failed_add_brings_the_cell_up(self, monkeypatch):
+        """The reconcile retries the same observation, and that retry is the whole recovery path."""
+        srv = RolloutServer(
+            server_cells={},
+            args=make_args(colocate=False, ft_components=[]),
+            context_lock=_make_lock(),
+            engine_provider=_StubProvider(),
+        )
+        monkeypatch.setattr(ServerCell, "init", _raise_async)
+
+        async with srv.context_lock:
+            with pytest.raises(RuntimeError, match="injected init failure"):
+                await srv.add_cell(self._make_meta())
+
+            monkeypatch.setattr(ServerCell, "init", _noop_async)
+            await srv.add_cell(self._make_meta())
+
             assert list(srv.server_cells) == ["inference-engine-0-0-0"]
             await srv.dispose()
 
@@ -314,7 +361,7 @@ class TestAddCellRollback:
         """Controller teardown must reach each cell so its health checker task stops with it."""
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=True, ft_components=[]),
+            args=make_args(colocate=True, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -331,7 +378,7 @@ class TestAddCellRollback:
         """After the failure is gone the same cell id can be added normally."""
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=False, ft_components=[]),
+            args=make_args(colocate=False, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -349,7 +396,10 @@ class TestDuplicateCellId:
     async def test_adding_a_duplicate_cell_id_preserves_the_original_cell(self, monkeypatch):
         """Overwriting the entry would drop the first cell's health checker task and router registration on the floor."""
         srv = RolloutServer(
-            server_cells={}, args=SimpleNamespace(colocate=True, ft_components=[]), context_lock=_make_lock()
+            server_cells={},
+            args=make_args(colocate=True, ft_components=[]),
+            context_lock=_make_lock(),
+            engine_provider=_StubProvider(),
         )
         monkeypatch.setattr(ServerCell, "init", _noop_async)
 
@@ -378,7 +428,10 @@ class TestRemoveCellDisposal:
             await real_dispose(cell)
 
         srv = RolloutServer(
-            server_cells={}, args=SimpleNamespace(colocate=True, ft_components=[]), context_lock=_make_lock()
+            server_cells={},
+            args=make_args(colocate=True, ft_components=[]),
+            context_lock=_make_lock(),
+            engine_provider=_StubProvider(),
         )
         monkeypatch.setattr(ServerCell, "init", _noop_async)
         monkeypatch.setattr(ServerCell, "dispose", _blocking_dispose)
@@ -408,7 +461,7 @@ class TestAddCellInitTiming:
 
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=False, ft_components=[]),
+            args=make_args(colocate=False, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -430,7 +483,7 @@ class TestAddCellInitTiming:
 
         srv = RolloutServer(
             server_cells={},
-            args=SimpleNamespace(colocate=True, ft_components=[]),
+            args=make_args(colocate=True, ft_components=[]),
             context_lock=_make_lock(),
             engine_provider=_StubProvider(),
         )
@@ -444,11 +497,6 @@ class TestAddCellInitTiming:
             await srv.dispose()
 
 
-class _StubProvider:
-    async def get_addrs(self, worker_name: str) -> NamedHostAndPorts:
-        raise AssertionError(f"cell startup is patched out in this module ({worker_name=})")
-
-
 async def _make_serving_server(monkeypatch, *, num_cells: int) -> RolloutServer:
     """A server whose cells are all registered and serving, without dialling anything."""
     router = _RecordingRouterApiClient()
@@ -456,7 +504,7 @@ async def _make_serving_server(monkeypatch, *, num_cells: int) -> RolloutServer:
 
     srv = RolloutServer(
         server_cells={},
-        args=SimpleNamespace(colocate=True, ft_components=[], use_miles_router=False),
+        args=make_args(colocate=True, ft_components=[], use_miles_router=False),
         context_lock=_make_lock(),
     )
     async with srv.context_lock:
@@ -493,6 +541,14 @@ class _RecordingRouterApiClient:
 
     async def remove_worker(self, **kwargs) -> None:
         self.calls.append(("remove_worker", kwargs))
+
+
+class _StubProvider:
+    async def get_addrs(self, worker_name: str) -> NamedHostAndPorts:
+        raise AssertionError(f"cell startup is patched out in this module ({worker_name=})")
+
+    def expected_num_cells(self, *, model_id: str) -> int | None:
+        return None
 
 
 def _make_lock() -> ContextLock:

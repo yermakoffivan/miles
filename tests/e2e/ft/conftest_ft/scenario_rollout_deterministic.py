@@ -3,6 +3,7 @@
 
 import contextlib
 import dataclasses
+import math
 import threading
 import time
 from collections.abc import Iterator
@@ -41,6 +42,9 @@ FIRST_ROLLOUT_POLL_SECONDS: float = 5.0
 MIN_CRASHED_ROLLOUTS: int = 2
 
 
+COLOCATED_MEM_FRACTION_STATIC: float = 0.4
+
+
 def _build_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> str:
     assert mode.has_real_rollout, f"{TEST_NAME} needs engines to crash, but mode {mode.model_name} has none"
     assert tuple(mode.ft_components) == ("rollout",), (
@@ -55,6 +59,10 @@ def _build_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> 
     args += f"--api-server-port {API_SERVER_PORT} --mini-ft-controller-enable "
     args += "--debug-deterministic-collective "
     args += "--sglang-disable-radix-cache "
+    if mode.colocate:
+        # the engines share the trainer's gpus here: at 0.6 they hold 84 of the card's 140 GiB
+        # and the trainer dies needing 58, so they get the smaller half of the card
+        args += f"--sglang-mem-fraction-static {COLOCATED_MEM_FRACTION_STATIC} "
     args += f"--rollout-health-check-interval {HEALTH_CHECK_INTERVAL_SECONDS} "
     args += get_true_on_policy_args(mode)
     args += "--weight-decay 0 "

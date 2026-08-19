@@ -3,6 +3,7 @@ from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from contextlib import AbstractContextManager, nullcontext
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import ray
@@ -23,6 +24,11 @@ from .mixin import DistBucketedWeightUpdateMixin
 
 if TYPE_CHECKING:
     pass
+
+# the rendezvous only asks the engines to dial in, which the ones that are up do within a second;
+# torch's own half hour is a budget for weight transfer, and spending it here hides the engine that
+# never answered behind a wait nobody can tell apart from a slow broadcast
+_RENDEZVOUS_TIMEOUT_SECONDS = 300.0
 
 
 class UpdateWeightFromDistributed(DistBucketedWeightUpdateMixin):
@@ -235,13 +241,20 @@ def connect_rollout_engines_from_distributed(
             )
         )
         rank_cursor += engine_gpu_counts[i]
-    model_update_groups = init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{master_address}:{master_port}",
-        world_size=world_size,
-        rank=0,
-        group_name=group_name,
-    )
+    # an engine only answers its invitation once the group is whole, so the invitations cannot be
+    # collected before joining; bounding the join is what lets wait_futures name the one that failed
+    try:
+        model_update_groups = init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=0,
+            group_name=group_name,
+            timeout=timedelta(seconds=_RENDEZVOUS_TIMEOUT_SECONDS),
+        )
+    except BaseException:
+        async_utils.wait_futures(futures)
+        raise
     async_utils.wait_futures(futures)
     return model_update_groups
 

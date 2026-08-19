@@ -447,14 +447,19 @@ class TestComputeTrainerArgs:
 class TestTrainerCheckpointDirs:
     def test_a_multi_policy_run_gives_every_trainer_its_own_checkpoint_dir(self, tmp_path):
         """A shared --save makes two policies write the same iter_* directory and overwrite each other."""
+        old = tmp_path / "old"
+        for trainer_id in ("a-actor", "b-actor"):
+            trainer_dir = old / "trainers" / trainer_id
+            trainer_dir.mkdir(parents=True)
+            (trainer_dir / "latest_checkpointed_iteration.txt").write_text("7")
         path = _write_yaml({"trainers": [{"model_id": "a"}, {"model_id": "b"}]}, tmp_path)
-        args = _make_args(path, save="/ckpt/run", load="/ckpt/old")
+        args = _make_args(path, save="/ckpt/run", load=str(old))
 
         model_a = _model_args(args, model_id="a")
         model_b = _model_args(args, model_id="b")
 
-        assert (model_a.save, model_a.load) == ("/ckpt/run/trainers/a-actor", "/ckpt/old/trainers/a-actor")
-        assert (model_b.save, model_b.load) == ("/ckpt/run/trainers/b-actor", "/ckpt/old/trainers/b-actor")
+        assert (model_a.save, model_a.load) == ("/ckpt/run/trainers/a-actor", str(old / "trainers" / "a-actor"))
+        assert (model_b.save, model_b.load) == ("/ckpt/run/trainers/b-actor", str(old / "trainers" / "b-actor"))
 
     def test_two_trainers_of_one_policy_do_not_share_a_directory(self, tmp_path):
         """A trainer id is unique where a model id is not, so keying the directory by the model would collide."""
@@ -672,7 +677,10 @@ class TestSynthesizedCriticTrainer:
         """kl_coef and load are not per-policy yaml arguments, yet the critic must still be able to set them."""
         args = _make_args(use_critic=True, critic_load="/ckpt/critic")
 
-        assert set(resolve_megatron_config(args).trainers[1].overrides) > set(PER_POLICY_ARGS)
+        overrides = set(resolve_megatron_config(args).trainers[1].overrides)
+
+        assert {"kl_coef", "load"} <= overrides
+        assert not {"kl_coef", "load"} & set(PER_POLICY_ARGS)
 
     def test_a_critic_without_its_own_schedule_inherits_the_unset_values(self, tmp_path):
         """--critic-lr is unset by default, and the critic takes it as it is: the policy's own lr does not apply."""
@@ -722,10 +730,17 @@ class TestPerPolicyArgsCoverage:
     @pytest.mark.parametrize("model_type", ["qwen2.5-0.5B", "qwen3-0.6B"])
     def test_the_whitelist_admits_every_argument_of_a_model_script(self, model_type):
         """A policy that cannot override one of its own architecture arguments would train another model's shape."""
-        declared = {
-            token.removeprefix("--").replace("-", "_")
-            for token in load_model_args(model_type).split()
-            if token.startswith("--")
-        }
+        options = get_megatron_arg_parser()._option_string_actions
+        flags = [token for token in load_model_args(model_type).split() if token.startswith("--")]
+        unknown = [flag for flag in flags if flag not in options]
+        assert not unknown, f"{model_type} passes {unknown}, which the megatron parser does not declare"
 
-        assert declared <= PER_POLICY_ARGS
+        assert {options[flag].dest for flag in flags} <= PER_POLICY_ARGS
+
+    def test_the_whitelist_names_arguments_the_parser_actually_produces(self):
+        """The override keys are compared against this set and then looked up by the same name in the
+        parser, so a flag spelled the way it appears on a command line admits nothing at all: a config
+        carrying the argument's real name is refused, and the name in the set can never be reached."""
+        parsed = {action.dest for action in get_megatron_arg_parser()._actions}
+
+        assert PER_POLICY_ARGS <= parsed

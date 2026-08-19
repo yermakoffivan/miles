@@ -43,7 +43,6 @@ def _minimal_run_values() -> dict[str, Any]:
         },
         "run": {
             "id": "260101-000000-000",
-            "dir": "/cluster-storage/miles_data/miles-runs/260101-000000-000",
             "stateFile": "/cluster-storage/miles_data/miles-runs/260101-000000-000/state/orchestrator.state",
             "objectNames": {
                 "orchestrator": "r-miles-run-orchestrator",

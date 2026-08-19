@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from collections.abc import AsyncIterator
 from types import ModuleType, SimpleNamespace
@@ -233,42 +234,20 @@ class TestWatchEvents:
         await collector.close()
 
     @pytest.mark.parametrize("event_type", ["ADDED", "MODIFIED", "DELETED"])
-    async def test_an_event_whose_key_cannot_be_read_is_skipped(self, event_type):
-        """A malformed watch event is dropped, and the events behind it are still delivered."""
+    async def test_a_pod_event_carrying_no_pod_fails_the_stream(self, event_type, caplog):
+        """Skipping it would leave the store silently short of a pod, so the stream must fail instead."""
         api = FakePodApi()
         api.list_pages.append(make_pod_list([], resource_version="1"))
         api.stream_scripts.append(
-            [
-                raw_event(event_type, SimpleNamespace(metadata=SimpleNamespace(resource_version="5"))),
-                raw_event("ADDED", make_pod("pod-0", resource_version="6")),
-            ]
+            [PodWatchEvent(type=event_type, pod=None, resource_version="5", rejects_cursor=False)]
         )
         api.stream_scripts.append(None)
         collector = EventCollector(make_reflector(api).watch())
-        await settle()
+        with caplog.at_level(logging.ERROR, logger="miles.utils.workers.reconcile.k8s_reflector"):
+            await settle()
 
-        assert [type(event) for event in collector.events] == [ReplaceEvent, UpsertEvent]
-        assert collector.events[1].key == "pod-0"
-        assert len(api.list_calls) == 1
-        assert len(api.stream_calls) == 1
-        await collector.close()
-
-    async def test_a_malformed_event_advances_the_cursor_past_itself(self):
-        """The cursor must clear a poison event, or every reconnect replays it forever."""
-        api = FakePodApi()
-        api.list_pages.append(make_pod_list([], resource_version="1"))
-        api.stream_scripts.append(
-            [raw_event("MODIFIED", SimpleNamespace(metadata=SimpleNamespace(resource_version="5")))]
-        )
-        api.stream_scripts.append(None)
-        clock = FakeClock()
-        collector = EventCollector(make_reflector(api, clock=clock, retry_delay=1.0).watch())
-        await settle()
-        await clock.elapse(1.0)
-        await settle()
-
-        assert [call["resource_version"] for call in api.stream_calls] == ["1", "5"]
-        assert len(api.list_calls) == 1
+        assert [type(event) for event in collector.events] == [ReplaceEvent]
+        assert "carries no pod" in caplog.text
         await collector.close()
 
     async def test_watch_end_resumes_without_relisting(self):

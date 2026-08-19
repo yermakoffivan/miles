@@ -9,7 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from miles.utils.misc import exec_command
+from tests.e2e.exec_utils import exec_command
 
 logger = logging.getLogger(__name__)
 

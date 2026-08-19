@@ -354,7 +354,7 @@ class TestRolloutCellHandler:
         manager = MockWorkerManager(make_cell_summaries("engine-a", "engine-b", "engine-c"))
         handler = _CellHandler(
             cell_type="rollout",
-            worker_manager=manager,
+            operations=RayCellOperations(worker_manager_handle=manager),
             controllers=[MockInferenceController()],
             pool_ids=_pool_ids_of(manager),
         )

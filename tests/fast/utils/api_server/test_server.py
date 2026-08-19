@@ -348,13 +348,13 @@ class TestStartApiServerRegistration:
         registry = self._start(
             monkeypatch,
             ft_components=["train", "rollout"],
-            cell_ids=["trainer-actor-0", "inference-engine-0-0-0"],
+            cell_ids=["trainer-engine-actor-0", "inference-engine-0-0-0"],
             actor_cells=[MockTrainerCell(phase="Running")],
         )
 
         cells = await registry.list_cells()
         assert [(cell.metadata.name, cell.metadata.labels["miles.io/cell-type"]) for cell in cells] == [
-            ("trainer-actor-0", "actor"),
+            ("trainer-engine-actor-0", "actor"),
             ("inference-engine-0-0-0", "rollout"),
         ]
 
@@ -364,7 +364,7 @@ class TestStartApiServerRegistration:
         registry = self._start(
             monkeypatch,
             ft_components=["rollout"],
-            cell_ids=["trainer-actor-0"],
+            cell_ids=["trainer-engine-actor-0"],
             actor_cells=[MockTrainerCell(phase="Running")],
         )
 
@@ -374,8 +374,7 @@ class TestStartApiServerRegistration:
     async def test_the_requested_port_reaches_the_server_that_binds_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The FT controller is told this port out of band, so binding any other one makes the api unreachable."""
         ports: list[int] = []
-        manager = MockWorkerManager(make_cell_summaries("trainer-actor-0"))
-        monkeypatch.setattr(server, "RayWorkerManager", SimpleNamespace(get_handle=lambda: manager))
+        manager = MockWorkerManager(make_cell_summaries("trainer-engine-actor-0"))
         monkeypatch.setattr(server, "_start_api_server_raw", lambda registry, port: ports.append(port))
 
         server.start_api_server(
@@ -384,6 +383,7 @@ class TestStartApiServerRegistration:
             inference_controller=MockInferenceController(),
             port=19137,
             ft_components=["train"],
+            cell_operations=RayCellOperations(worker_manager_handle=manager),
         )
 
         assert ports == [19137]

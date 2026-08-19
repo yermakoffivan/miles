@@ -239,7 +239,9 @@ def get_train_env_vars_arg(mode: FTTestMode, *, deterministic: bool) -> str:
     env_vars: dict[str, str] = {}
     if deterministic:
         env_vars.update(_DETERMINISTIC_ENV_VARS)
-    if mode.has_real_rollout:
+    if mode.has_real_rollout and not mode.colocate:
+        # a colocated engine gives its memory back through TorchMemorySaver, which refuses to
+        # run at all under expandable segments, so the two cannot be asked for together
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     if not env_vars:
         return ""
